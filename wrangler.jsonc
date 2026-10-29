@@ -1,0 +1,6 @@
+{
+  "name": "family-tg-gpt",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-29",
+  "workers_dev": true
+}
