@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createWorker, historyKey, fileKey } from "../src/bot.js";
-import { buildDocx, buildXlsx, buildPptx, extractFileBlocks, safeFileName, parseSheets, parseSlides, MIME } from "../src/build.js";
+import { buildDocx, buildXlsx, buildPptx, extractFileBlocks, safeFileName, parseSheets, MIME } from "../src/build.js";
+import { parseDeck, splitOverfull, pickTheme, THEMES, fitSize } from "../src/slides.js";
 import { extractDocx, extractXlsx, extractPptx, classifyDocument, decodeText } from "../src/files.js";
 import { createZip, openZip } from "../src/zip.js";
 import { makeEnv, makeFetch, messagesReply, textUpdate, documentUpdate, webhookRequest, execCtx, sentTexts } from "./helpers.js";
@@ -66,18 +67,46 @@ test("xlsx: numbers, percents, formulas, several sheets", async () => {
   assert.match(text, /## Лист «Второй»/);
 });
 
-test("pptx: title slide + content slides, extract text back", async () => {
-  const md = "# Модель Солоу\nЭкономика\n---\n# Уравнение\n- k̇ = s√k − δk\n  - вложенный\n# Вывод\n- рост";
-  const slides = parseSlides(md);
-  assert.equal(slides.length, 3);
-  const bytes = buildPptx(md);
+test("pptx: designed 16:9 deck, layouts inferred, text extractable", async () => {
+  const md = "# Модель Солоу\nЭкономика\n---\n# Теория\n---\n# Уравнение\n- k̇ = s√k − δk\n---\n# Факторы\n## Капитал\nтекст\n## Труд\nтекст\n## Технологии\nтекст\n---\n# 73%\nподпись\n---\n> цитата\n— Автор\n---\n# Спасибо за внимание!";
+  const bytes = buildPptx(md, { theme: "night" });
   const zip = openZip(bytes);
-  assert.ok(zip.names.includes("ppt/slides/slide3.xml"));
-  assert.match(await zip.text("ppt/slides/_rels/slide1.xml.rels"), /slideLayout1/);
-  assert.match(await zip.text("ppt/slides/_rels/slide2.xml.rels"), /slideLayout2/);
-  assert.match(await zip.text("ppt/presentation.xml"), /<p:sldIdLst><p:sldId id="256" r:id="rId10"\/>/);
+  assert.ok(zip.names.includes("ppt/slides/slide7.xml"));
+  assert.match(await zip.text("ppt/presentation.xml"), /<p:sldSz cx="12191695" cy="6858000"\/>/);
+  assert.match(await zip.text("ppt/slides/slide1.xml"), /0B1120/, "night theme colours used");
+  assert.match(await zip.text("ppt/slides/slide2.xml"), />01</, "section number");
+  assert.match(await zip.text("ppt/slides/slide4.xml"), /Технологии/);
   const { text } = await extractPptx(bytes);
-  assert.match(text, /## Слайд 2\nУравнение\nk̇ = s√k − δk\nвложенный/);
+  assert.match(text, /Уравнение[\s\S]*k̇ = s√k − δk/);
+  assert.match(text, /73%/);
+});
+
+test("deck parsing and layout directives", () => {
+  const deck = parseDeck("@layout: cards\n# A\n## x\n1\n## y\n2\n---\n# B\n1. a\n2. b\n3. c\n---\n@layout: compare\n# C\n- p\n- q");
+  assert.equal(deck.length, 3);
+  assert.equal(deck[0].layout, "cards");
+  assert.equal(deck[0].sections.length, 2);
+  assert.equal(deck[1].numbers.length, 3);
+  assert.equal(deck[2].layout, "two-columns");
+  // slides without "---" are split on "# " headings
+  assert.equal(parseDeck("# A\n- x\n# B\n- y").length, 2);
+});
+
+test("themes: names, Russian aliases, fallback", () => {
+  assert.equal(pickTheme("forest"), "forest");
+  assert.equal(pickTheme("Тёмная"), "night");
+  assert.equal(pickTheme("что-то"), "ocean");
+  for (const t of Object.values(THEMES)) for (const k of ["dark", "primary", "accent", "bg", "card", "text"]) assert.match(t[k], /^[0-9A-F]{6}$/);
+});
+
+test("overfull bullet slides are split, short text gets a big font", () => {
+  const long = "очень длинный пункт ".repeat(8);
+  const deck = parseDeck("# T\nsub\n---\n# Много\n" + Array.from({ length: 12 }, () => "- " + long).join("\n"));
+  const out = splitOverfull(deck);
+  assert.ok(out.length >= 3);
+  assert.match(out[2].title, /продолжение/);
+  assert.ok(fitSize(["коротко"], 10, 4, 30, 12) === 30);
+  assert.ok(fitSize([long.repeat(5)], 10, 1, 30, 12) < 20);
 });
 
 test("file blocks are extracted from the answer", () => {

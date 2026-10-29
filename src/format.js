@@ -7,11 +7,11 @@
 // inject arbitrary HTML.
 
 // Private-use characters as temporary markers (never appear in normal text).
-const B_OPEN = "", B_CLOSE = "";
-const I_OPEN = "", I_CLOSE = "";
-const S_OPEN = "", S_CLOSE = "";
-const CODE_SLOT = ""; // <n> placeholder for code
-const CODE_END = "";
+const B_OPEN = "\uE000", B_CLOSE = "\uE001";
+const I_OPEN = "\uE002", I_CLOSE = "\uE003";
+const S_OPEN = "\uE004", S_CLOSE = "\uE005";
+const CODE_SLOT = "\uE010"; // \uE010<n>\uE011 placeholder for code
+const CODE_END = "\uE011";
 
 export function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -541,7 +541,7 @@ function markersToTags(s) {
  * Main entry: model text -> Telegram HTML (parse_mode: "HTML").
  */
 export function toTelegramHtml(input) {
-  let text = String(input ?? "").replace(/\r\n?/g, "\n").replace(/[-]/g, "");
+  let text = String(input ?? "").replace(/\r\n?/g, "\n").replace(/[\uE000-\uE0FF]/g, "");
   const codes = [];
   const slot = html => { codes.push(html); return `${CODE_SLOT}${codes.length - 1}${CODE_END}`; };
 

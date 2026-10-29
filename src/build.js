@@ -3,8 +3,10 @@
 //   <file type="docx|xlsx|pptx" name="Имя.docx"> ...markdown... </file>
 
 import { createZip } from "./zip.js";
-import { convertLatex } from "./format.js";
-import * as T from "./pptx-template.js";
+import { xml, prepare, inlineRuns, parseBlocks, isTableRow, isSeparator, splitRow } from "./markdown.js";
+import { buildPptx, parseDeck, THEMES } from "./slides.js";
+
+export { xml, inlineRuns, parseBlocks, buildPptx, parseDeck, THEMES };
 
 export const MIME = {
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -15,27 +17,11 @@ const DEFAULT_NAMES = { docx: "Документ.docx", xlsx: "Таблица.xls
 
 /* ------------------------------ helpers ------------------------------ */
 
-export function xml(s) {
-  return String(s ?? "")
-    // characters not allowed in XML 1.0
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]/g, "")
-    .replace(/[-]/g, "")
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
 export function safeFileName(name, type) {
   let n = String(name || "").replace(/[\\/:*?"<>|\u0000-\u001F]/g, "").replace(/\s+/g, " ").trim().slice(0, 80);
   if (!n) n = DEFAULT_NAMES[type];
   if (!n.toLowerCase().endsWith("." + type)) n = n.replace(/\.[A-Za-z0-9]{2,5}$/, "") + "." + type;
   return n;
-}
-
-/** Markdown text with LaTeX converted to Unicode; boxed answers become **bold**. */
-function prepare(md) {
-  const parts = String(md).replace(/\r\n?/g, "\n").split(/(```[\s\S]*?(?:```|$))/);
-  return parts.map((p, k) => (k % 2 ? p : convertLatex(p)))
-    .join("")
-    .replace(/[]/g, "**").replace(/[]/g, "*").replace(/[]/g, "~~");
 }
 
 /** Extracts <file …>…</file> blocks from the answer. */
@@ -48,64 +34,11 @@ export function extractFileBlocks(answer) {
     if (!MIME[type]) return _;
     files.push({
       type, name: safeFileName(attr("name"), type), content: content.replace(/\s+$/, ""),
-      font: attr("font"), size: Number(attr("size")) || undefined,
+      font: attr("font"), size: Number(attr("size")) || undefined, theme: attr("theme"),
     });
     return `\n[[FILE:${files.length - 1}]]\n`;
   });
   return { text: text.replace(/\n?\[\[FILE:\d+\]\]\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim(), files };
-}
-
-/** Inline Markdown -> [{text, b, i, code, s}] */
-export function inlineRuns(line, base = {}) {
-  const runs = [];
-  const re = /\*\*(?=\S)([\s\S]+?)\*\*|`([^`]+)`|~~([^~]+)~~|(?<![\p{L}\p{N}*])\*(?=[^\s*])([^*\n]+?)\*(?![\p{L}\p{N}*])|(?<![\p{L}\p{N}_])_(?=[^\s_])([^_\n]+?)_(?![\p{L}\p{N}_])|\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gu;
-  let last = 0, m;
-  while ((m = re.exec(line))) {
-    if (m.index > last) runs.push({ ...base, text: line.slice(last, m.index) });
-    if (m[1] !== undefined) runs.push(...inlineRuns(m[1], { ...base, b: true }));
-    else if (m[2] !== undefined) runs.push({ ...base, text: m[2], code: true });
-    else if (m[3] !== undefined) runs.push({ ...base, text: m[3], s: true });
-    else if (m[4] !== undefined || m[5] !== undefined) runs.push(...inlineRuns(m[4] ?? m[5], { ...base, i: true }));
-    else runs.push({ ...base, text: `${m[6]} (${m[7]})` });
-    last = re.lastIndex;
-  }
-  if (last < line.length) runs.push({ ...base, text: line.slice(last) });
-  return runs.filter(r => r.text);
-}
-
-const isTableRow = l => /^\s*\|.*\|\s*$/.test(l);
-const isSeparator = l => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
-const splitRow = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
-
-/** Generic Markdown block parser shared by Word and PowerPoint. */
-export function parseBlocks(md) {
-  const lines = md.split("\n");
-  const blocks = [];
-  for (let k = 0; k < lines.length; k++) {
-    const line = lines[k];
-    if (/^\s*```/.test(line)) {
-      const code = [];
-      for (k++; k < lines.length && !/^\s*```/.test(lines[k]); k++) code.push(lines[k]);
-      blocks.push({ type: "code", lines: code });
-      continue;
-    }
-    if (isTableRow(line)) {
-      const rows = [];
-      for (; k < lines.length && isTableRow(lines[k]); k++) if (!isSeparator(lines[k])) rows.push(splitRow(lines[k]));
-      k--;
-      blocks.push({ type: "table", rows });
-      continue;
-    }
-    let m;
-    if ((m = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line))) { blocks.push({ type: "heading", level: m[1].length, text: m[2] }); continue; }
-    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { blocks.push({ type: "rule" }); continue; }
-    if ((m = /^(\s*)[-*+•]\s+(.*)$/.exec(line))) { blocks.push({ type: "bullet", level: Math.min(Math.floor(m[1].replace(/\t/g, "  ").length / 2), 4), text: m[2] }); continue; }
-    if ((m = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(line))) { blocks.push({ type: "number", level: Math.min(Math.floor(m[1].length / 2), 4), n: Number(m[2]), text: m[3] }); continue; }
-    if ((m = /^\s*>\s?(.*)$/.exec(line))) { blocks.push({ type: "quote", text: m[1] }); continue; }
-    if (!line.trim()) { blocks.push({ type: "blank" }); continue; }
-    blocks.push({ type: "para", text: line });
-  }
-  return blocks;
 }
 
 /* ------------------------------ Word ------------------------------ */
@@ -327,105 +260,11 @@ export function buildXlsx(markdown) {
   return createZip(files);
 }
 
-/* ------------------------------ PowerPoint ------------------------------ */
-
-const P_NS = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"';
-const REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-
-function aRuns(text) {
-  const runs = inlineRuns(text).map(r =>
-    `<a:r><a:rPr lang="ru-RU" dirty="0"${r.b ? ' b="1"' : ""}${r.i ? ' i="1"' : ""}${r.s ? ' strike="sngStrike"' : ""}>${r.code ? '<a:latin typeface="Consolas"/>' : ""}</a:rPr><a:t>${xml(r.text)}</a:t></a:r>`).join("");
-  return runs || '<a:endParaRPr lang="ru-RU" dirty="0"/>';
-}
-
-/** Markdown -> [{title, items: [{text, level, bullet}]}] */
-export function parseSlides(md) {
-  const slides = [];
-  let cur = null;
-  const push = () => { cur = { title: "", items: [] }; slides.push(cur); };
-  for (const b of parseBlocks(md)) {
-    if (b.type === "rule") { cur = null; continue; }
-    if (b.type === "heading" && b.level <= 2) {
-      if (!cur || cur.title || cur.items.length) push();
-      cur.title = b.text.replace(/\*\*/g, "");
-      continue;
-    }
-    if (!cur) push();
-    if (b.type === "bullet") cur.items.push({ text: b.text, level: b.level, bullet: true });
-    else if (b.type === "number") cur.items.push({ text: `${b.n}. ${b.text}`, level: b.level, bullet: false });
-    else if (b.type === "heading") cur.items.push({ text: `**${b.text.replace(/\*\*/g, "")}**`, level: 0, bullet: false });
-    else if (b.type === "para" || b.type === "quote") cur.items.push({ text: b.text, level: 0, bullet: false });
-    else if (b.type === "table") for (const row of b.rows) cur.items.push({ text: row.join("  —  "), level: 0, bullet: true });
-    else if (b.type === "code") for (const l of b.lines) cur.items.push({ text: "`" + l + "`", level: 0, bullet: false });
-  }
-  return slides.filter(s => s.title || s.items.length);
-}
-
-function slideXml(slide, isTitleSlide) {
-  const sp = (id, name, ph, paras, bodyPr = "<a:bodyPr/>") =>
-    `<p:sp><p:nvSpPr><p:cNvPr id="${id}" name="${name}"/><p:cNvSpPr><a:spLocks noGrp="1"/></p:cNvSpPr><p:nvPr>${ph}</p:nvPr></p:nvSpPr><p:spPr/><p:txBody>${bodyPr}<a:lstStyle/>${paras}</p:txBody></p:sp>`;
-  const titlePara = `<a:p>${aRuns(slide.title || " ")}</a:p>`;
-  let shapes;
-  if (isTitleSlide) {
-    const sub = slide.items.map(it => `<a:p>${aRuns(it.text)}</a:p>`).join("") || "<a:p><a:endParaRPr lang=\"ru-RU\"/></a:p>";
-    shapes = sp(2, "Title 1", '<p:ph type="ctrTitle"/>', titlePara) + sp(3, "Subtitle 2", '<p:ph type="subTitle" idx="1"/>', sub);
-  } else {
-    const chars = slide.items.reduce((n, it) => n + it.text.length, 0);
-    const lines = slide.items.length;
-    const scale = chars > 900 || lines > 12 ? 55000 : chars > 650 || lines > 10 ? 65000 : chars > 450 || lines > 8 ? 77500 : chars > 300 || lines > 6 ? 90000 : 0;
-    const bodyPr = scale ? `<a:bodyPr><a:normAutofit fontScale="${scale}" lnSpcReduction="10000"/></a:bodyPr>` : "<a:bodyPr><a:normAutofit/></a:bodyPr>";
-    const paras = slide.items.map(it => {
-      const lvl = it.level ? ` lvl="${it.level}"` : "";
-      const pPr = it.bullet ? (lvl ? `<a:pPr${lvl}/>` : "") : `<a:pPr marL="0" indent="0"${lvl}><a:buNone/></a:pPr>`;
-      return `<a:p>${pPr}${aRuns(it.text)}</a:p>`;
-    }).join("") || '<a:p><a:endParaRPr lang="ru-RU"/></a:p>';
-    shapes = sp(2, "Title 1", '<p:ph type="title"/>', titlePara) + sp(3, "Content Placeholder 2", '<p:ph idx="1"/>', paras, bodyPr);
-  }
-  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:sld ${P_NS}><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${shapes}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;
-}
-
-export function buildPptx(markdown) {
-  let slides = parseSlides(prepare(markdown));
-  if (!slides.length) slides = [{ title: "Презентация", items: [] }];
-  slides = slides.slice(0, 60);
-  // A first slide with only a title and up to two short lines becomes the title slide.
-  const titleFirst = slides.length > 1 && slides[0].items.length <= 2 && slides[0].items.every(i => i.text.length < 120);
-  const rels = (target, type) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/${type}" Target="${target}"/></Relationships>`;
-  const sldIds = slides.map((_, k) => `<p:sldId id="${256 + k}" r:id="rId${10 + k}"/>`).join("");
-  const files = [
-    { name: "[Content_Types].xml", data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slideMasters/slideMaster1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/><Override PartName="/ppt/slideLayouts/slideLayout1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/><Override PartName="/ppt/slideLayouts/slideLayout2.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/><Override PartName="/ppt/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/><Override PartName="/ppt/presProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presProps+xml"/><Override PartName="/ppt/viewProps.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.viewProps+xml"/><Override PartName="/ppt/tableStyles.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.tableStyles+xml"/>${slides.map((_, k) => `<Override PartName="/ppt/slides/slide${k + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`).join("")}</Types>` },
-    { name: "_rels/.rels", data: rels("ppt/presentation.xml", "officeDocument") },
-    { name: "ppt/presentation.xml", data: T.PRESENTATION.replace("{{SLIDES}}", `<p:sldIdLst>${sldIds}</p:sldIdLst>`) },
-    { name: "ppt/_rels/presentation.xml.rels", data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slideMaster" Target="slideMasters/slideMaster1.xml"/><Relationship Id="rId3" Type="${REL}/presProps" Target="presProps.xml"/><Relationship Id="rId4" Type="${REL}/viewProps" Target="viewProps.xml"/><Relationship Id="rId5" Type="${REL}/theme" Target="theme/theme1.xml"/><Relationship Id="rId6" Type="${REL}/tableStyles" Target="tableStyles.xml"/>${slides.map((_, k) => `<Relationship Id="rId${10 + k}" Type="${REL}/slide" Target="slides/slide${k + 1}.xml"/>`).join("")}</Relationships>` },
-    { name: "ppt/presProps.xml", data: T.PRES_PROPS },
-    { name: "ppt/viewProps.xml", data: T.VIEW_PROPS },
-    { name: "ppt/tableStyles.xml", data: T.TABLE_STYLES },
-    { name: "ppt/theme/theme1.xml", data: T.THEME },
-    { name: "ppt/slideMasters/slideMaster1.xml", data: T.MASTER },
-    { name: "ppt/slideMasters/_rels/slideMaster1.xml.rels", data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/><Relationship Id="rId2" Type="${REL}/slideLayout" Target="../slideLayouts/slideLayout2.xml"/><Relationship Id="rId3" Type="${REL}/theme" Target="../theme/theme1.xml"/></Relationships>` },
-    { name: "ppt/slideLayouts/slideLayout1.xml", data: T.LAYOUT_TITLE },
-    { name: "ppt/slideLayouts/slideLayout2.xml", data: T.LAYOUT_CONTENT },
-    { name: "ppt/slideLayouts/_rels/slideLayout1.xml.rels", data: rels("../slideMasters/slideMaster1.xml", "slideMaster") },
-    { name: "ppt/slideLayouts/_rels/slideLayout2.xml.rels", data: rels("../slideMasters/slideMaster1.xml", "slideMaster") },
-  ];
-  slides.forEach((s, k) => {
-    const isTitle = k === 0 && titleFirst;
-    files.push({ name: `ppt/slides/slide${k + 1}.xml`, data: slideXml(s, isTitle) });
-    files.push({ name: `ppt/slides/_rels/slide${k + 1}.xml.rels`, data: rels(`../slideLayouts/slideLayout${isTitle ? 1 : 2}.xml`, "slideLayout") });
-  });
-  return createZip(files);
-}
-
 /* ------------------------------ entry ------------------------------ */
 
 export function buildFile(block) {
   if (block.type === "docx") return buildDocx(block.content, { font: block.font, size: block.size, title: block.name.replace(/\.docx$/i, "") });
   if (block.type === "xlsx") return buildXlsx(block.content);
-  if (block.type === "pptx") return buildPptx(block.content);
+  if (block.type === "pptx") return buildPptx(block.content, { theme: block.theme });
   throw new Error("unknown_file_type");
 }
