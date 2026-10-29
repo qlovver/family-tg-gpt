@@ -2,7 +2,7 @@
 // Secrets: TELEGRAM_BOT_TOKEN, TOOKEN_API_KEY, WEBHOOK_SECRET, SETUP_KEY.
 // Text variable: ALLOWED_USER_IDS="123,456". KV binding: HISTORY.
 
-const MODEL = "gpt-6.1-terra"; // Verify access to this model in Tooken Club.
+const MODEL = "claude-opus-5-5"; // Verify access to this model in Tooken Club.
 const MAX_IMAGE_SIZE = 2_500_000; // 2.5 MB; use Telegram's compressed Photo option.
 const MAX_HISTORY = 10; // Text messages, unique for each Telegram user.
 const SYSTEM_PROMPT =
