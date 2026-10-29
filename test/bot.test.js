@@ -322,3 +322,13 @@ test("model list falls back to the built-in catalogue when Tooken doesn't return
   const menu = f.calls.telegram.find(c => c.method === "sendMessage" && c.body.reply_markup);
   assert.ok(menu.body.reply_markup.inline_keyboard.flat().length >= 10);
 });
+
+test("/setup in Telegram sends the link; /check runs the probes", async () => {
+  const env = makeEnv(); const f = makeFetch({ model: (url, body) => ({ json: messagesReply("Красный круг") }) });
+  await send(env, f, textUpdate(111, "/setup"));
+  assert.match(sentTexts(f.calls).at(-1), /\/setup/);
+  await send(env, f, textUpdate(111, "/check"));
+  const report = sentTexts(f.calls).at(-1);
+  assert.match(report, /Проверка модели/);
+  assert.match(report, /Подлинность/);
+});

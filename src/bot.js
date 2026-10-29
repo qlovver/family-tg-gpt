@@ -419,6 +419,7 @@ const HELP = `<b>Привет! Я ИИ-помощник 🤖</b>
 <b>Команды</b>
 /model — выбрать модель ИИ
 /agent — сервер-агент (красивые файлы, графики, PDF)
+/check — проверить модель (инструменты, зрение, подлинность)
 /word — прислать мой последний ответ файлом Word
 /reset — очистить историю и забыть файл (только свои)
 /retry — повторить последний неудачный запрос
@@ -882,6 +883,31 @@ export async function handleUpdate(update, ctx) {
     await sendHtml(telegram, chatId, `🖥 <b>Сервер-агент</b>: ${escapeHtml(st)}\nДля тебя: <b>${rec0.agent === false ? "выключен" : "включён"}</b>\n\nАгент сам пишет код, проверяет результат и присылает файлы — для презентаций, документов, таблиц, графиков, PDF.\n/agent on · /agent off`);
     return "ok";
   }
+  if (command === "/setup") {
+    const origin = ctx.origin || "https://family-tg-gpt.qlovver.workers.dev";
+    await sendHtml(telegram, chatId, `⚙️ Настройка открывается в браузере:\n${escapeHtml(origin)}/setup\n\nПроверить модель можно прямо здесь: /check`);
+    return "ok";
+  }
+  if (command === "/check") {
+    const rec0 = await loadRecord(kv, uid);
+    const model = currentModel(rec0, env);
+    await sendHtml(telegram, chatId, `🔎 Проверяю <code>${escapeHtml(model)}</code>… (несколько маленьких запросов, ~20–40 с)`);
+    const lines = [`🔎 <b>Проверка модели</b> <code>${escapeHtml(model)}</code>`];
+    try {
+      const c = await probeCapabilities(env, model, { fetchImpl: ctx.fetchImpl });
+      lines.push(`Инструменты: ${escapeHtml(c.tools)}`, `Зрение: ${escapeHtml(c.vision)}`, `Модель в ответе: <code>${escapeHtml(c.response_model || "—")}</code>`);
+    } catch (err) { lines.push(`Инструменты/зрение: ошибка ${escapeHtml(String(err?.message || err).slice(0, 80))}`); }
+    if (/^claude/i.test(model)) {
+      try {
+        const a = await probeAuthenticity(env, model, { fetchImpl: ctx.fetchImpl });
+        lines.push("", `<b>Подлинность:</b> ${escapeHtml(a.verdict)}`, `ID ответа: <code>${escapeHtml(a.response_id || "—")}</code> — ${escapeHtml(a.id_format || "")}`);
+        if (a.signature) lines.push(`Подпись размышлений: ${escapeHtml(a.signature)}`);
+        if (a.tampered_signature_rejected) lines.push(`Испорченная подпись отклонена: ${escapeHtml(a.tampered_signature_rejected)}`);
+      } catch (err) { lines.push(`Подлинность: ошибка ${escapeHtml(String(err?.message || err).slice(0, 80))}`); }
+    } else lines.push("", "Проверка подлинности по подписи есть только для Claude-моделей.");
+    await sendHtml(telegram, chatId, lines.join("\n"));
+    return "ok";
+  }
   if (command === "/word") {
     await exportLastAnswer(ctx, uid, chatId);
     return "ok";
@@ -926,7 +952,7 @@ export async function handleUpdate(update, ctx) {
     return r === "undelivered" ? "retry" : "ok";
   }
   if (command) {
-    await sendHtml(telegram, chatId, "Команды: /start, /help, /model, /agent, /word, /reset, /retry, /id");
+    await sendHtml(telegram, chatId, "Команды: /start, /help, /model, /agent, /check, /word, /reset, /retry, /id");
     return "ok";
   }
 
@@ -1011,6 +1037,7 @@ async function runSetup(request, env, ctx) {
           { command: "help", description: "Как пользоваться ботом" },
           { command: "model", description: "Выбрать модель ИИ" },
           { command: "agent", description: "Сервер-агент: статус, вкл/выкл" },
+          { command: "check", description: "Проверить модель" },
           { command: "reset", description: "Очистить мою историю" },
           { command: "retry", description: "Повторить неудачный запрос" },
           { command: "id", description: "Мой Telegram ID" },
@@ -1092,8 +1119,8 @@ export function createWorker(options = {}) {
     async fetch(request, env, execCtx) {
       const fetchImpl = options.fetchImpl || ((...a) => fetch(...a));
       const kv = env.HISTORY || null;
-      const ctx = { env, kv, fetchImpl, telegram: makeTelegram(env, fetchImpl), modelTimeoutMs: options.modelTimeoutMs };
       const url = new URL(request.url);
+      const ctx = { env, kv, fetchImpl, telegram: makeTelegram(env, fetchImpl), modelTimeoutMs: options.modelTimeoutMs, origin: url.origin };
 
       if (request.method === "GET" && url.pathname === "/") {
         const checks = configChecks(env, kv);
