@@ -5,7 +5,7 @@
 // Optional:  MODEL, API_FORMAT (messages|chat|responses), MODEL_STREAM, MAX_OUTPUT_TOKENS, TOOKEN_BASE_URL
 
 import { toTelegramHtml, splitHtml, htmlToPlain, escapeHtml } from "./format.js";
-import { askModel, ModelError, modelConfig } from "./model.js";
+import { askModel, ModelError, modelConfig, listModels, DEFAULT_MODEL } from "./model.js";
 import { classifyDocument, extractDocument, base64FromBytes, MAX_FILE_SIZE, MAX_PDF_SIZE, MAX_EXTRACT_CHARS } from "./files.js";
 import { extractFileBlocks, buildFile, buildDocx, safeFileName, MIME } from "./build.js";
 import { extractEditBlocks, applyEdits, docxForEdit, pptxForEdit, editKindOf } from "./edit.js";
@@ -294,6 +294,112 @@ export function trimHistory(messages) {
   return out;
 }
 
+/* ============================== models ============================== */
+
+// Used when Tooken doesn't return its model list. IDs as in Tooken's catalogue.
+export const FALLBACK_MODELS = [
+  "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+  "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-6-astra",
+  "gemini-4-argon", "gemini-3.8-flash", "deepseek-v4-pro", "grok-4.7", "kimi-k3.1-pro", "glm-5.3",
+];
+const MODELS_KEY = "models:list";
+
+export function prettyModel(id) {
+  const s = String(id);
+  const brand = { claude: "Claude", gpt: "GPT", gemini: "Gemini", deepseek: "DeepSeek", grok: "Grok", kimi: "Kimi", glm: "GLM", qwen: "Qwen", llama: "Llama", mistral: "Mistral" };
+  const parts = s.split("-");
+  const head = brand[parts[0].toLowerCase()] || parts[0];
+  const rest = parts.slice(1);
+  // join version digits: "5","5" -> "5.5"
+  const out = [];
+  for (const p of rest) {
+    const prev = out[out.length - 1];
+    if (/^\d{1,2}$/.test(p) && prev && /\d$/.test(prev) && !/\./.test(prev)) out[out.length - 1] += "." + p;
+    else out.push(/^\d/.test(p) ? p : p.charAt(0).toUpperCase() + p.slice(1));
+  }
+  // GPT-6.1 style: brand and version joined with a dash
+  if (head === "GPT" && out.length && /^\d/.test(out[0])) return `GPT-${out[0]} ${out.slice(1).join(" ")}`.trim();
+  return [head, ...out].join(" ");
+}
+
+async function availableModels(ctx) {
+  const { kv, env, fetchImpl } = ctx;
+  const cached = kv ? await kv.get(MODELS_KEY, "json").catch(() => null) : null;
+  if (cached?.length) return cached;
+  const live = await listModels(env, { fetchImpl });
+  const list = live || FALLBACK_MODELS;
+  if (live && kv) await kv.put(MODELS_KEY, JSON.stringify(list), { expirationTtl: 6 * 3600 }).catch(() => {});
+  return list;
+}
+
+function modelKeyboard(models, current) {
+  const sorted = [...models].sort((a, b) => {
+    const rank = id => ["claude", "gpt", "gemini", "deepseek", "grok"].findIndex(p => id.toLowerCase().startsWith(p));
+    const ra = rank(a), rb = rank(b);
+    return (ra < 0 ? 99 : ra) - (rb < 0 ? 99 : rb) || a.localeCompare(b);
+  });
+  const buttons = sorted.filter(id => `m:${id}`.length <= 64).map(id => ({ text: `${id === current ? "✅ " : ""}${prettyModel(id)}`, callback_data: `m:${id}` }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  return { inline_keyboard: rows };
+}
+
+export function currentModel(rec, env) {
+  return rec?.model || env.MODEL || DEFAULT_MODEL;
+}
+
+// Make sure Telegram sends button presses (older webhook setups only had "message").
+async function ensureCallbacks(ctx) {
+  try {
+    const info = await ctx.telegram("getWebhookInfo", {});
+    if (info?.url && !(info.allowed_updates || []).includes("callback_query") && ctx.env.WEBHOOK_SECRET) {
+      await ctx.telegram("setWebhook", { url: info.url, secret_token: ctx.env.WEBHOOK_SECRET, max_connections: info.max_connections || 1, allowed_updates: ["message", "callback_query"] });
+      log("webhook_updated", { allowed_updates: ["message", "callback_query"] });
+    }
+  } catch (err) {
+    log("webhook_check_failed", { message: String(err?.message || "").slice(0, 120) });
+  }
+}
+
+async function showModelMenu(ctx, uid, chatId) {
+  const [rec, models] = await Promise.all([loadRecord(ctx.kv, uid), availableModels(ctx)]);
+  await ensureCallbacks(ctx);
+  const cur = currentModel(rec, ctx.env);
+  await ctx.telegram("sendMessage", {
+    chat_id: chatId, parse_mode: "HTML",
+    text: `🧠 <b>Выбор модели</b>\nСейчас: <b>${escapeHtml(prettyModel(cur))}</b> (<code>${escapeHtml(cur)}</code>)\n\nВыбор действует только для тебя. История диалога сохраняется.\n<i>Названия моделей даёт Tooken Club; какая модель отвечает на самом деле, проверить нельзя.</i>`,
+    reply_markup: modelKeyboard(models, cur),
+  });
+}
+
+async function setUserModel(ctx, uid, model) {
+  const rec = await loadRecord(ctx.kv, uid);
+  rec.model = model;
+  await saveRecord(ctx.kv, uid, rec);
+}
+
+async function handleCallback(cq, ctx) {
+  const { env, telegram, kv } = ctx;
+  const uid = String(cq.from?.id || "");
+  const answer = text => telegram("answerCallbackQuery", { callback_query_id: cq.id, text, show_alert: false }).catch(() => {});
+  if (!allowedIds(env).includes(uid)) { await answer("🔒 Это приватный бот"); return "ok"; }
+  const data = String(cq.data || "");
+  if (!data.startsWith("m:") || !kv) { await answer(""); return "ok"; }
+  const model = data.slice(2);
+  const models = await availableModels(ctx);
+  if (!models.includes(model)) { await answer("Этой модели больше нет в списке"); return "ok"; }
+  await setUserModel(ctx, uid, model);
+  await answer(`Модель: ${prettyModel(model)}`);
+  if (cq.message) {
+    await telegram("editMessageText", {
+      chat_id: cq.message.chat.id, message_id: cq.message.message_id, parse_mode: "HTML",
+      text: `🧠 <b>Модель выбрана:</b> ${escapeHtml(prettyModel(model))} (<code>${escapeHtml(model)}</code>)\nМожно продолжать диалог. Сменить — /model`,
+    }).catch(() => {});
+  }
+  log("model_selected", { uid, model });
+  return "ok";
+}
+
 /* ============================== texts ============================== */
 
 const HELP = `<b>Привет! Я ИИ-помощник 🤖</b>
@@ -311,6 +417,7 @@ const HELP = `<b>Привет! Я ИИ-помощник 🤖</b>
 • Если ответ оборвался — напиши «продолжи».
 
 <b>Команды</b>
+/model — выбрать модель ИИ
 /word — прислать мой последний ответ файлом Word
 /reset — очистить историю и забыть файл (только свои)
 /retry — повторить последний неудачный запрос
@@ -328,7 +435,9 @@ export function errorText(code, hint) {
     case "auth_failed":
       return "🔑 Tooken Club не принял API-ключ. Нужно проверить секрет TOOKEN_API_KEY в Cloudflare.";
     case "model_not_found":
-      return "❓ Tooken Club не нашёл модель. Нужно проверить название модели и доступ к ней в кабинете Tooken.";
+      return "❓ Tooken Club не нашёл выбранную модель. Выбери другую: /model";
+    case "image_unsupported":
+      return "🖼 Эта модель, похоже, не понимает фото или файлы. Выбери другую (например, Claude или GPT): /model";
     case "endpoint_not_found":
     case "bad_request":
       return "⚠️ Сервис ИИ отклонил запрос (неподходящий формат). Отправь /retry; если повторится — нужна проверка настроек бота.";
@@ -564,12 +673,14 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
       history: rec.messages,
       text: prefix ? `${prefix}\n\n${question}` : question,
       image: attachment,
+      model: currentModel(rec, env),
       maxTokens: req.wantsFile ? 8000 : undefined,
     }, { fetchImpl, timeoutMs: ctx.modelTimeoutMs ?? MODEL_TIMEOUT_MS });
   } catch (err) {
     clearInterval(timer);
     let code = err instanceof ModelError ? err.code : "unknown";
     if (code === "bad_request" && req.file?.kind === "pdf") code = "pdf_rejected";
+    else if (code === "bad_request" && (req.image || req.file)) code = "image_unsupported";
     if (!(err instanceof ModelError)) log("request_error", { name: err?.name, message: String(err?.message || "").slice(0, 200) });
     await telegram("sendMessage", { chat_id: chatId, text: errorText(code) }).catch(e => log("send_error", { message: e.message }));
     return "failed";
@@ -625,6 +736,7 @@ async function exportLastAnswer(ctx, uid, chatId) {
  */
 export async function handleUpdate(update, ctx) {
   const { env, telegram } = ctx;
+  if (update?.callback_query) return handleCallback(update.callback_query, ctx);
   const msg = update?.message;
   if (!msg || msg.chat?.type !== "private" || !msg.from?.id || msg.from.is_bot) return "ok";
   const uid = String(msg.from.id);
@@ -658,10 +770,25 @@ export async function handleUpdate(update, ctx) {
 
   if (command === "/reset") {
     // Only the caller's own keys, derived from the verified sender ID.
-    await kv.delete(historyKey(uid));
+    const prev = await loadRecord(kv, uid);
+    if (prev.model) await saveRecord(kv, uid, { v: 2, messages: [], model: prev.model });
+    else await kv.delete(historyKey(uid));
     await kv.delete(fileKey(uid));
     await kv.delete(genKey(uid));
     await telegram("sendMessage", { chat_id: chatId, text: "🧹 Твоя история очищена, присланный файл забыт. Начинаем с чистого листа." });
+    return "ok";
+  }
+  if (command === "/model" || command === "/models") {
+    const arg = rawText.split(/\s+/)[1];
+    if (arg) {
+      const models = await availableModels(ctx);
+      const pick = models.find(m => m.toLowerCase() === arg.toLowerCase()) || models.find(m => m.toLowerCase().includes(arg.toLowerCase()));
+      if (!pick) { await telegram("sendMessage", { chat_id: chatId, text: "Не нашёл такую модель. Список: /model" }); return "ok"; }
+      await setUserModel(ctx, uid, pick);
+      await sendHtml(telegram, chatId, `🧠 Модель: <b>${escapeHtml(prettyModel(pick))}</b>`);
+      return "ok";
+    }
+    await showModelMenu(ctx, uid, chatId);
     return "ok";
   }
   if (command === "/word") {
@@ -708,7 +835,7 @@ export async function handleUpdate(update, ctx) {
     return r === "undelivered" ? "retry" : "ok";
   }
   if (command) {
-    await sendHtml(telegram, chatId, "Команды: /start, /help, /word, /reset, /retry, /id");
+    await sendHtml(telegram, chatId, "Команды: /start, /help, /model, /word, /reset, /retry, /id");
     return "ok";
   }
 
@@ -775,10 +902,11 @@ async function runSetup(request, env, ctx) {
           // One update at a time: keeps each person's dialogue in order and
           // prevents parallel writes to the same history.
           max_connections: 1,
-          allowed_updates: ["message"],
+          allowed_updates: ["message", "callback_query"],
         });
         await telegram("setMyCommands", { commands: [
           { command: "help", description: "Как пользоваться ботом" },
+          { command: "model", description: "Выбрать модель ИИ" },
           { command: "reset", description: "Очистить мою историю" },
           { command: "retry", description: "Повторить неудачный запрос" },
           { command: "id", description: "Мой Telegram ID" },

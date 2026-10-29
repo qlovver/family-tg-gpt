@@ -269,3 +269,56 @@ test("non-private chats and edited messages are ignored", async () => {
 test("MemoryKV sanity", async () => {
   const kv = new MemoryKV(); await kv.put("a", "1"); assert.equal(await kv.get("a"), "1");
 });
+
+test("model choice: /model menu, button press, per-user model in requests", async () => {
+  const env = makeEnv();
+  const f = makeFetch({
+    telegram: m => (m === "getWebhookInfo" ? { json: { ok: true, result: { url: "https://x.dev/webhook", allowed_updates: ["message"], max_connections: 1 } } } : null),
+  });
+  // Tooken model list
+  const orig = f.fetch;
+  const fetch2 = async (url, init) => String(url).endsWith("/v1/models")
+    ? Response.json({ data: [{ id: "claude-opus-5-5" }, { id: "gpt-6.1-sol" }, { id: "gpt-image-2.5-sunburst" }] })
+    : orig(url, init);
+  const worker = createWorker({ fetchImpl: fetch2 });
+  const go = u => worker.fetch(webhookRequest(u), env, execCtx);
+
+  await go(textUpdate(111, "/model"));
+  const menu = f.calls.telegram.find(c => c.method === "sendMessage" && c.body.reply_markup);
+  const buttons = menu.body.reply_markup.inline_keyboard.flat();
+  assert.deepEqual(buttons.map(b => b.callback_data), ["m:claude-opus-5-5", "m:gpt-6.1-sol"], "image models hidden");
+  assert.match(buttons[0].text, /✅ Claude Opus 5.5/);
+  assert.ok(f.calls.telegram.some(c => c.method === "setWebhook" && c.body.allowed_updates.includes("callback_query")), "webhook upgraded for buttons");
+
+  await go({ update_id: 777001, callback_query: { id: "cq1", from: { id: 111 }, data: "m:gpt-6.1-sol", message: { message_id: 5, chat: { id: 111 } } } });
+  assert.ok(f.calls.telegram.some(c => c.method === "answerCallbackQuery"));
+  assert.ok(f.calls.telegram.some(c => c.method === "editMessageText" && /GPT-6.1 Sol/.test(c.body.text)));
+
+  await go(textUpdate(111, "привет"));
+  const req = f.calls.model.at(-1);
+  assert.equal(req.body.model, "gpt-6.1-sol");
+  assert.equal(req.url, "https://tooken.club/v1/chat/completions", "GPT goes to chat completions");
+
+  // the other user keeps the default
+  await go(textUpdate(222, "привет"));
+  assert.equal(f.calls.model.at(-1).body.model, "claude-opus-5-5");
+  assert.equal(f.calls.model.at(-1).url, "https://tooken.club/v1/messages");
+
+  // /reset keeps the choice, strangers can't press buttons
+  await go(textUpdate(111, "/reset"));
+  await go(textUpdate(111, "ещё раз"));
+  assert.equal(f.calls.model.at(-1).body.model, "gpt-6.1-sol");
+  await go({ update_id: 777002, callback_query: { id: "cq2", from: { id: 999 }, data: "m:claude-opus-5-5" } });
+  assert.equal(JSON.parse(env.HISTORY.map.get(historyKey("111"))).model, "gpt-6.1-sol");
+
+  // /model with an argument
+  await go(textUpdate(111, "/model opus"));
+  assert.equal(JSON.parse(env.HISTORY.map.get(historyKey("111"))).model, "claude-opus-5-5");
+});
+
+test("model list falls back to the built-in catalogue when Tooken doesn't return it", async () => {
+  const env = makeEnv(); const f = makeFetch({ model: (url) => ({ status: 404, json: {} }) });
+  await send(env, f, textUpdate(111, "/model"));
+  const menu = f.calls.telegram.find(c => c.method === "sendMessage" && c.body.reply_markup);
+  assert.ok(menu.body.reply_markup.inline_keyboard.flat().length >= 10);
+});

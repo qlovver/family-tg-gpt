@@ -19,12 +19,22 @@ export class ModelError extends Error {
   }
 }
 
-export function modelConfig(env = {}) {
-  const format = String(env.API_FORMAT || "messages").toLowerCase();
+// Which API format a model uses at Tooken: Claude -> Messages, GPT-6.1 Terra ->
+// Responses (as the catalogue says), everything else -> Chat Completions.
+export function formatFor(model, env = {}) {
+  const forced = String(env.API_FORMAT || "").toLowerCase();
+  if (["messages", "chat", "responses"].includes(forced)) return forced;
+  if (/^claude/i.test(model)) return "messages";
+  if (/terra/i.test(model)) return "responses";
+  return "chat";
+}
+
+export function modelConfig(env = {}, modelOverride) {
+  const model = String(modelOverride || env.MODEL || DEFAULT_MODEL);
   return {
     baseUrl: String(env.TOOKEN_BASE_URL || DEFAULT_BASE_URL).replace(/\/+$/, ""),
-    model: String(env.MODEL || DEFAULT_MODEL),
-    format: ["messages", "chat", "responses"].includes(format) ? format : "messages",
+    model,
+    format: formatFor(model, env),
     stream: env.MODEL_STREAM === "1" || env.MODEL_STREAM === "true",
     maxTokens: Number(env.MAX_OUTPUT_TOKENS) > 0 ? Number(env.MAX_OUTPUT_TOKENS) : DEFAULT_MAX_TOKENS,
   };
@@ -227,7 +237,7 @@ async function callOnce(cfg, format, env, payload, fetchImpl, signal) {
  */
 export async function askModel(env, payload, { fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   if (!env.TOOKEN_API_KEY) throw new ModelError("auth_failed", "TOOKEN_API_KEY is not set");
-  const cfg = modelConfig(env);
+  const cfg = modelConfig(env, payload.model);
   if (Number(payload.maxTokens) > 0) cfg.maxTokens = Number(payload.maxTokens);
   const started = Date.now();
   // AbortController + setTimeout (works in Workers and Node; cleared on finish).
@@ -244,6 +254,7 @@ export async function askModel(env, payload, { fetchImpl = fetch, timeoutMs = DE
 async function callWithRetries(cfg, env, payload, fetchImpl, deadline, started) {
   let format = cfg.format;
   let attempt = 0;
+  const tried = new Set();
   for (;;) {
     attempt++;
     try {
@@ -261,9 +272,10 @@ async function callWithRetries(cfg, env, payload, fetchImpl, deadline, started) 
       }
       if (!(err instanceof ModelError)) throw new ModelError("network_error", String(err?.message || err).slice(0, 200));
       console.warn(JSON.stringify({ event: "model_error", format, code: err.code, status: err.status, detail: err.detail, requestId: err.requestId || undefined }));
-      // Endpoint missing (nothing billed): try the OpenAI-compatible route once.
-      if (err.code === "endpoint_not_found" && format === "messages" && !env.API_FORMAT) {
-        format = "chat";
+      // Endpoint missing (nothing billed): try another API format once.
+      if (err.code === "endpoint_not_found" && !env.API_FORMAT && !tried.has("fallback")) {
+        tried.add("fallback");
+        format = format === "chat" ? "responses" : "chat";
         continue;
       }
       if (RETRYABLE.has(err.code) && attempt === 1 && Date.now() - started < 25_000) {
@@ -272,5 +284,27 @@ async function callWithRetries(cfg, env, payload, fetchImpl, deadline, started) 
       }
       throw err;
     }
+  }
+}
+
+/* ---------------------------- model list ---------------------------- */
+
+const NOT_CHAT = /image|dall|whisper|tts|audio|embed|moderation|rerank|transcri|speech|video|sora/i;
+
+/** Asks Tooken for its models (OpenAI-style GET /models). Returns ids or null. */
+export async function listModels(env, { fetchImpl = fetch } = {}) {
+  const { baseUrl } = modelConfig(env);
+  try {
+    const res = await fetchImpl(`${baseUrl}/models`, {
+      headers: { authorization: `Bearer ${env.TOOKEN_API_KEY}`, "x-api-key": env.TOOKEN_API_KEY || "" },
+      signal: AbortSignal.timeout ? AbortSignal.timeout(8000) : undefined,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const items = Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : Array.isArray(data) ? data : [];
+    const ids = items.map(m => (typeof m === "string" ? m : m?.id || m?.name)).filter(id => typeof id === "string" && id && !NOT_CHAT.test(id));
+    return ids.length ? [...new Set(ids)] : null;
+  } catch {
+    return null;
   }
 }
