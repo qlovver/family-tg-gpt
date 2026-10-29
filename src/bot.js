@@ -418,6 +418,7 @@ const HELP = `<b>Привет! Я ИИ-помощник 🤖</b>
 
 <b>Команды</b>
 /model — выбрать модель ИИ
+/agent — сервер-агент (красивые файлы, графики, PDF)
 /word — прислать мой последний ответ файлом Word
 /reset — очистить историю и забыть файл (только свои)
 /retry — повторить последний неудачный запрос
@@ -731,6 +732,87 @@ async function exportLastAnswer(ctx, uid, chatId) {
   await sendFile(ctx.telegram, chatId, name, MIME.docx, bytes);
 }
 
+/* ============================== server agent ============================== */
+
+const AGENT_WORDS = /график|диаграм|схем|pdf|пдф|рисун|картин|визуал|постер|инфограф|плакат|открытк|логотип|чертёж|чертеж|майнд|mind ?map|красив|дизайн|оформи/i;
+
+export function agentEnabled(env, rec) {
+  return !!(env.AGENT_URL && env.AGENT_SECRET) && rec?.agent !== false;
+}
+
+export function shouldUseAgent(req) {
+  const t = req.text || "";
+  if (AGENT_WORDS.test(t) || FILE_WORDS.test(t)) return true;
+  if (req.file && ["docx", "xlsx", "pptx", "pdf"].includes(req.file.kind) && EDIT_WORDS.test(t)) return true;
+  return false;
+}
+
+/** Hands a heavy task to the server agent. Returns true when the agent accepted it. */
+async function dispatchToAgent(ctx, uid, chatId, msg, req, rec) {
+  const { env, kv, fetchImpl } = ctx;
+  const files = [];
+  const photos = [];
+  if (req.file) files.push({ file_id: req.file.fileId, name: req.file.name });
+  if (req.image) photos.push({ file_id: req.image.fileId });
+  if (!req.file && !req.image && EDIT_WORDS.test(req.text || "")) {
+    const last = await kv.get(fileKey(uid), "json").catch(() => null);
+    if (last?.fileId) files.push({ file_id: last.fileId, name: last.name });
+  }
+  const job = {
+    chat_id: chatId, uid, reply_to: msg.message_id, model: currentModel(rec, env),
+    text: userPrompt(req), history: rec.messages.slice(-8), history_entry: historyUserEntry(req), files, photos,
+  };
+  try {
+    const res = await fetchImpl(`${String(env.AGENT_URL).replace(/\/+$/, "")}/job`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-agent-secret": env.AGENT_SECRET },
+      body: JSON.stringify(job),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (res.status === 202 || res.ok) {
+      const data = await res.json().catch(() => ({}));
+      log("agent_dispatched", { uid, position: data.position });
+      if (data.position > 0) await ctx.telegram("sendMessage", { chat_id: chatId, text: `⏳ Задача в очереди (перед ней ${data.position}). Пришлю результат, как будет готово.` }).catch(() => {});
+      return true;
+    }
+    log("agent_rejected", { status: res.status });
+  } catch (err) {
+    log("agent_unreachable", { message: String(err?.message || err).slice(0, 120) });
+  }
+  return false;
+}
+
+/** POST /agent/done from the server: store the exchange in the user's history. */
+async function agentDone(request, env, kv) {
+  if (!env.AGENT_SECRET || !safeEqual(request.headers.get("x-agent-secret"), env.AGENT_SECRET)) return json({ error: "Forbidden" }, 403);
+  if (!kv) return json({ error: "no storage" }, 500);
+  let body;
+  try { body = await request.json(); } catch { return json({ error: "Invalid JSON" }, 400); }
+  const uid = String(body.uid || "");
+  if (!allowedIds(env).includes(uid)) return json({ error: "unknown user" }, 403);
+  const rec = await loadRecord(kv, uid);
+  rec.messages = trimHistory([
+    ...rec.messages,
+    { role: "user", content: String(body.user || "").slice(0, MAX_USER_CHARS) || "(задача для сервера)" },
+    { role: "assistant", content: String(body.answer || "Готово.").slice(0, MAX_STORED_ANSWER) },
+  ]);
+  await saveRecord(kv, uid, rec);
+  const f = Array.isArray(body.files) ? body.files.filter(x => x?.file_id && x?.name).pop() : null;
+  if (f) await kv.put(fileKey(uid), JSON.stringify({ name: f.name, kind: classifyDocument({ file_name: f.name }).kind || "file", fileId: f.file_id, ts: Date.now() }), { expirationTtl: LAST_FILE_TTL }).catch(() => {});
+  return json({ ok: true });
+}
+
+async function agentStatus(env, fetchImpl) {
+  if (!env.AGENT_URL || !env.AGENT_SECRET) return "не подключён (нет AGENT_URL / AGENT_SECRET в Cloudflare)";
+  try {
+    const res = await fetchImpl(`${String(env.AGENT_URL).replace(/\/+$/, "")}/health`, { signal: AbortSignal.timeout(6000) });
+    const d = await res.json();
+    return d.ok ? `работает ✅ (в очереди: ${d.queue}${d.running ? ", сейчас занят задачей" : ""}; выполнено: ${d.done})` : `отвечает с ошибкой (${res.status})`;
+  } catch (err) {
+    return `не отвечает ❌ (${String(err?.message || err).slice(0, 80)})`;
+  }
+}
+
 /**
  * Handles one Telegram update. Returns "ok" or "retry" (ask Telegram to redeliver).
  */
@@ -791,6 +873,15 @@ export async function handleUpdate(update, ctx) {
     await showModelMenu(ctx, uid, chatId);
     return "ok";
   }
+  if (command === "/agent" || command === "/server") {
+    const arg = (rawText.split(/\s+/)[1] || "").toLowerCase();
+    const rec0 = await loadRecord(kv, uid);
+    if (arg === "off" || arg === "выкл") { rec0.agent = false; await saveRecord(kv, uid, rec0); }
+    if (arg === "on" || arg === "вкл") { delete rec0.agent; await saveRecord(kv, uid, rec0); }
+    const st = await agentStatus(env, ctx.fetchImpl);
+    await sendHtml(telegram, chatId, `🖥 <b>Сервер-агент</b>: ${escapeHtml(st)}\nДля тебя: <b>${rec0.agent === false ? "выключен" : "включён"}</b>\n\nАгент сам пишет код, проверяет результат и присылает файлы — для презентаций, документов, таблиц, графиков, PDF.\n/agent on · /agent off`);
+    return "ok";
+  }
   if (command === "/word") {
     await exportLastAnswer(ctx, uid, chatId);
     return "ok";
@@ -835,7 +926,7 @@ export async function handleUpdate(update, ctx) {
     return r === "undelivered" ? "retry" : "ok";
   }
   if (command) {
-    await sendHtml(telegram, chatId, "Команды: /start, /help, /model, /word, /reset, /retry, /id");
+    await sendHtml(telegram, chatId, "Команды: /start, /help, /model, /agent, /word, /reset, /retry, /id");
     return "ok";
   }
 
@@ -849,6 +940,15 @@ export async function handleUpdate(update, ctx) {
     return "ok";
   }
   req.wantsFile = FILE_WORDS.test(req.text);
+  if (agentEnabled(env, rec) && shouldUseAgent(req)) {
+    if (await dispatchToAgent(ctx, uid, chatId, msg, req, rec)) {
+      // remember this update so a Telegram retry doesn't start the job twice
+      rec.lastUpdateId = updateId;
+      await saveRecord(kv, uid, rec);
+      return "ok";
+    }
+    await telegram("sendMessage", { chat_id: chatId, text: "🖥 Сервер сейчас недоступен — сделаю попроще, прямо здесь." }).catch(() => {});
+  }
   const r = await runRequest(ctx, uid, chatId, updateId, req, msg.message_id);
   return r === "undelivered" ? "retry" : "ok";
 }
@@ -909,6 +1009,7 @@ async function runSetup(request, env, ctx) {
         await telegram("setMyCommands", { commands: [
           { command: "help", description: "Как пользоваться ботом" },
           { command: "model", description: "Выбрать модель ИИ" },
+          { command: "agent", description: "Сервер-агент: статус, вкл/выкл" },
           { command: "reset", description: "Очистить мою историю" },
           { command: "retry", description: "Повторить неудачный запрос" },
           { command: "id", description: "Мой Telegram ID" },
@@ -968,6 +1069,7 @@ function configChecks(env, kv) {
     WEBHOOK_SECRET: !!env.WEBHOOK_SECRET,
     SETUP_KEY: !!env.SETUP_KEY,
     allowed_users: allowedIds(env).length,
+    agent: !!(env.AGENT_URL && env.AGENT_SECRET),
     model: cfg.model,
     api_format: cfg.format,
   };
@@ -994,6 +1096,7 @@ export function createWorker(options = {}) {
         if (request.method === "GET") return html(setupPage(url.searchParams.has("code")
           ? "<p>⚠️ Ключ больше не передаётся в адресе. Введи его в поле выше. Ссылку с ключом лучше удалить из истории браузера.</p>" : ""));
       }
+      if (request.method === "POST" && url.pathname === "/agent/done") return agentDone(request, env, kv);
       if (request.method !== "POST" || url.pathname !== "/webhook") return json({ error: "Not found" }, 404);
 
       if (!env.WEBHOOK_SECRET || !safeEqual(request.headers.get("X-Telegram-Bot-Api-Secret-Token"), env.WEBHOOK_SECRET)) {
