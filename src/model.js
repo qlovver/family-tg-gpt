@@ -374,3 +374,47 @@ export async function probeCapabilities(env, model, { fetchImpl = fetch } = {}) 
   }
   return out;
 }
+
+/* ---------------------------- authenticity probe ---------------------------- */
+
+/**
+ * Is this really Anthropic's Claude behind the proxy?
+ * Claude's "thinking" blocks carry a cryptographic signature that only
+ * Anthropic's API can verify. We send the block back with a corrupted
+ * signature: the real API must reject it; a fake backend won't notice.
+ */
+export async function probeAuthenticity(env, model, { fetchImpl = fetch } = {}) {
+  const out = { model };
+  const ask = { role: "user", content: "Сколько будет 17 × 23? Ответь только числом." };
+  const thinking = { type: "enabled", budget_tokens: 1024 };
+  const r1 = await rawCall(env, model, "messages", { max_tokens: 1600, thinking, messages: [ask] }, fetchImpl);
+  out.response_id = String(r1.data?.id || "");
+  out.id_format = /^msg_01[A-Za-z0-9]{20,}$/.test(out.response_id) ? "✅ как у Anthropic (msg_01…)" : "⚠️ не как у Anthropic";
+  if (!r1.ok) {
+    out.verdict = `❓ модель не поддерживает режим размышлений через Tooken (ошибка ${r1.status}: ${r1.raw.slice(0, 120)})`;
+    return out;
+  }
+  const blocks = Array.isArray(r1.data?.content) ? r1.data.content : [];
+  const th = blocks.find(b => b.type === "thinking");
+  const textBlock = blocks.find(b => b.type === "text") || { type: "text", text: "391" };
+  if (!th) { out.verdict = "⚠️ блока размышлений нет — так настоящий Claude с thinking не отвечает"; return out; }
+  const sig = String(th.signature || "");
+  out.signature = sig ? `есть (${sig.length} симв.)` : "нет";
+  if (sig.length < 50) { out.verdict = "⚠️ подписи нет или она слишком короткая — признак подделки"; return out; }
+  // corrupt the middle of the signature
+  const mid = Math.floor(sig.length / 2);
+  const bad = sig.slice(0, mid) + (sig[mid] === "A" ? "B" : "A") + sig.slice(mid + 1);
+  const follow = sigValue => ({
+    max_tokens: 1600, thinking,
+    messages: [ask, { role: "assistant", content: [{ type: "thinking", thinking: th.thinking, signature: sigValue }, textBlock] }, { role: "user", content: "А 2 + 2? Только число." }],
+  });
+  const [good, tampered] = [await rawCall(env, model, "messages", follow(sig), fetchImpl), await rawCall(env, model, "messages", follow(bad), fetchImpl)];
+  out.valid_signature_accepted = good.ok ? "✅ да" : `❌ нет (${good.status})`;
+  out.tampered_signature_rejected = !tampered.ok ? `✅ да (${tampered.status}: ${tampered.raw.slice(0, 80)})` : "❌ нет — испорченную подпись приняли";
+  out.verdict = good.ok && !tampered.ok
+    ? "✅ Похоже на настоящий Claude: подпись проверяется на стороне Anthropic"
+    : good.ok && tampered.ok
+      ? "❌ Скорее всего НЕ Anthropic Claude: испорченная подпись прошла"
+      : "❓ Неясно: даже правильная подпись не принята";
+  return out;
+}

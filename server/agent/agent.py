@@ -298,7 +298,7 @@ def run_python(job, code):
     os.chmod(path, 0o644)
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": job["dir"], "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
            "MPLBACKEND": "Agg", "MPLCONFIGDIR": os.path.join(job["dir"], ".mpl"), "PYTHONIOENCODING": "utf-8",
-           "TMPDIR": os.path.join(job["dir"], "tmp")}
+           "TMPDIR": os.path.join(job["dir"], "tmp"), "PYTHONPATH": job["work"]}
     os.makedirs(env["TMPDIR"], exist_ok=True)
     cmd = [PYTHON_BIN, path]
     if SANDBOX_USER:
@@ -422,7 +422,23 @@ SYSTEM = """Ты — ИИ-агент с собственным Linux-компь�
 3. Если есть недочёты — исправь и отрисуй ещё раз (обычно 1–3 круга).
 4. Отправь файл(ы) send_file и закончи finish с коротким сообщением по-русски: что сделано и что внутри (без пересказа всего содержимого).
 
-Дизайн: делай как профессионал, а не по шаблону — продуманная сетка, крупные заголовки, воздух, единая цветовая палитра (3–4 цвета), акцентный цвет для главного, иконки/фигуры/диаграммы вместо сплошного текста, разные типы слайдов, 16:9 для презентаций. Следуй пожеланиям пользователя по цветам, шрифтам, стилю. Для учебных работ по ГОСТу: Times New Roman 14, интервал 1,5, поля 30/15/20/20 мм, отступ 1,25 см, нумерация страниц.
+Дизайн — как у профессионального дизайнера, а не по шаблону:
+- Для презентаций ИСПОЛЬЗУЙ готовый модуль design.py (он уже лежит в work/, импорт: from design import *). Он проверен и даёт:
+  new_presentation() (16:9), blank_slide(prs), set_background(slide, color) или set_background(slide, image=..., prs=prs),
+  gradient_image(path, [цвета], angle=35, blobs=True) — красивый градиентный фон с размытыми пятнами,
+  text(slide, x, y, w, h, "текст **акцент**", size, color, font, bold, align, anchor, bullets=True, accent=цвет),
+  shape(slide, 'round'|'circle'|'pill'|'rect'|'chevron'|'arrow'|'hexagon'|'star', x, y, w, h, fill, alpha=0.3, shadow=True),
+  gradient(shape, [цвета], angle), add_shadow(shape), card(slide, x, y, w, h, заголовок, текст, accent, number=1),
+  icon_circle(slide, x, y, d, "★"|"✓"|"⚡"|"♥"|"☀"|"➜"|"◆"|цифра, fill),
+  chart(slide, x, y, w, h, 'column'|'bar'|'line'|'pie'|'doughnut'|'area', категории, {"Серия": [числа]}, colors),
+  add_transition(slide, 'fade'|'push'|'wipe'|'cover'|'split'|'zoom'), appear_on_click(slide, [фигуры]) — анимация появления,
+  PALETTES (midnight, sunset, forest, ocean, royal, candy, mono), check_overflow(prs) — проверка, что текст влезает.
+  Координаты — в дюймах, слайд 13.333 × 7.5.
+- Шрифты: используй те, что есть и на iPhone, и в Office: Georgia (элегантные заголовки), Trebuchet MS (дружелюбный текст), Verdana, Arial, Times New Roman. Не используй экзотические шрифты — на телефоне они заменятся.
+- Каждая презентация: продуманная палитра из 3–4 цветов, крупные заголовки (36–54 pt), текст 16–22 pt, много воздуха, разные типы слайдов (титул с градиентным фоном, карточки, крупная цифра, диаграмма, сравнение в колонках, таймлайн, цитата, финал), иконки и фигуры вместо сплошного текста, плавные переходы на всех слайдах, анимация появления для ключевых пунктов.
+- Графики для документов и отчётов рисуй matplotlib (dpi 200, аккуратный стиль, подписи по-русски) и вставляй картинкой.
+- Следуй пожеланиям пользователя по цветам, шрифтам, стилю, количеству слайдов.
+- Для учебных работ по ГОСТу: Times New Roman 14, интервал 1,5, поля 30/15/20/20 мм, отступ 1,25 см, нумерация страниц.
 Правка файла пользователя: открой его из input/, внеси изменения, сохраняя оформление, и сохрани в out/ под тем же именем.
 Не выдумывай факты; если данных не хватает — сделай разумно и скажи об этом в итоговом сообщении. Пиши по-русски."""
 
@@ -864,6 +880,11 @@ def process(job):
     for d in (job["work"], job["out"], inp):
         os.makedirs(d, exist_ok=True)
         os.chmod(d, 0o777)
+    # tested design helpers for the model: from design import *
+    try:
+        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "design.py"), os.path.join(job["work"], "design.py"))
+    except Exception as e:
+        log("design_copy_failed", error=str(e)[:100])
     os.chmod(job["dir"], 0o777)
     status = Status(job["chat_id"], job.get("reply_to"))
     started = time.time()

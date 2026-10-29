@@ -25,7 +25,12 @@ apt-get install -y --no-install-recommends \
   python3 python3-venv python3-pip git curl ca-certificates sudo iptables \
   libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
   poppler-utils fonts-dejavu fonts-liberation2 fonts-crosextra-carlito fonts-crosextra-caladea fonts-noto-core \
-  debian-keyring debian-archive-keyring apt-transport-https gnupg
+  debian-keyring debian-archive-keyring apt-transport-https gnupg fontconfig
+
+# Georgia, Verdana, Trebuchet MS, Arial, Times New Roman — so previews match what iPhone/Office show
+echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
+apt-get install -y ttf-mscorefonts-installer || echo "⚠️ MS core fonts не установились — не страшно, будут похожие шрифты"
+fc-cache -f >/dev/null 2>&1 || true
 
 if ! command -v caddy >/dev/null; then
   say "Ставлю Caddy (HTTPS)"

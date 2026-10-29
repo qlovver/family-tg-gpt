@@ -138,3 +138,19 @@ test("capability probe detects tool calls and vision", async () => {
   assert.match(g.tools, /❌ ответил без инструмента/);
   assert.match(g.vision, /❌ не видит/);
 });
+
+test("authenticity probe: tampered thinking signature must be rejected", async () => {
+  const { probeAuthenticity } = await import("../src/model.js");
+  const sig = "S".repeat(40) + "AbCdEfGh".repeat(20);
+  const make = verifies => async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (body.messages.length === 1) return Response.json({ id: "msg_01AbCdEfGhIjKlMnOpQrStUv", content: [{ type: "thinking", thinking: "17*23=391", signature: sig }, { type: "text", text: "391" }] });
+    const sent = body.messages[1].content[0].signature;
+    if (verifies && sent !== sig) return Response.json({ error: { message: "Invalid signature in thinking block" } }, { status: 400 });
+    return Response.json({ id: "msg_01x", content: [{ type: "text", text: "4" }] });
+  };
+  const real = await probeAuthenticity({ TOOKEN_API_KEY: "k" }, "claude-opus-5-5", { fetchImpl: make(true) });
+  assert.match(real.verdict, /✅ Похоже на настоящий/);
+  const fake = await probeAuthenticity({ TOOKEN_API_KEY: "k" }, "claude-opus-5-5", { fetchImpl: make(false) });
+  assert.match(fake.verdict, /НЕ Anthropic/);
+});
