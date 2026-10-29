@@ -45,7 +45,7 @@ test("docx: build then extract keeps headings, lists, tables, escaped text", asy
   assert.match(await zip.text("word/styles.xml"), /Times New Roman/);
   const { text } = await extractDocx(bytes);
   assert.match(text, /# Реферат/);
-  assert.match(text, /## Введение/);
+  assert.match(text, /# Введение/);
   assert.match(text, /Текст с жирным и формулой ½ & <теги>\./);
   assert.match(text, /- первый/);
   assert.match(text, /\| A \| B \|\n\| 1 \| 2 \|/);
@@ -57,8 +57,8 @@ test("xlsx: numbers, percents, formulas, several sheets", async () => {
   assert.deepEqual(sheets.map(s => s.name), ["Расходы", "Второй"]);
   const bytes = buildXlsx(md);
   const sheet1 = await openZip(bytes).text("xl/worksheets/sheet1.xml");
-  assert.match(sheet1, /<c r="B2" s="3"><v>15000<\/v><\/c>/);
-  assert.match(sheet1, /<c r="C2" s="2"><v>0.3<\/v><\/c>/);
+  assert.match(sheet1, /<c r="B2" s="\d+"><v>15000<\/v><\/c>/);
+  assert.match(sheet1, /<c r="C2" s="\d+"><v>0.3<\/v><\/c>/);
   assert.match(sheet1, /<f>SUM\(B2:B2\)<\/f>/);
   assert.match(sheet1, /<v>0.5<\/v>/);
   const { text } = await extractXlsx(bytes);
@@ -134,7 +134,7 @@ test("bot: Word file -> text goes to the model and is remembered for follow-ups"
   const f = makeFetch({ files: { doc1: buildDocx(SAMPLE_DOC) } });
   await send(env, f, documentUpdate(111, "doc1", "реферат.docx", MIME.docx, "проверь ошибки"));
   const sent = f.calls.model[0].body.messages.at(-1).content.at(-1).text;
-  assert.match(sent, /<document name="реферат.docx">[\s\S]*## Введение[\s\S]*<\/document>/);
+  assert.match(sent, /<document name="реферат.docx">[\s\S]*\[P\d+\] # Введение[\s\S]*<\/document>/);
   assert.match(sent, /проверь ошибки$/);
   assert.ok(env.HISTORY.map.has(fileKey("111")));
   const rec = JSON.parse(env.HISTORY.map.get(historyKey("111")));

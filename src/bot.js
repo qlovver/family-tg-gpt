@@ -6,8 +6,9 @@
 
 import { toTelegramHtml, splitHtml, htmlToPlain, escapeHtml } from "./format.js";
 import { askModel, ModelError, modelConfig } from "./model.js";
-import { classifyDocument, extractDocument, base64FromBytes, MAX_FILE_SIZE, MAX_PDF_SIZE } from "./files.js";
+import { classifyDocument, extractDocument, base64FromBytes, MAX_FILE_SIZE, MAX_PDF_SIZE, MAX_EXTRACT_CHARS } from "./files.js";
 import { extractFileBlocks, buildFile, buildDocx, safeFileName, MIME } from "./build.js";
+import { extractEditBlocks, applyEdits, docxForEdit, pptxForEdit, editKindOf } from "./edit.js";
 
 export const MAX_IMAGE_SIZE = 2_500_000;      // bytes, after Telegram compression
 export const MAX_IMAGE_SIDE = 1600;           // px; Claude downsizes larger images anyway
@@ -51,8 +52,10 @@ export const SYSTEM_PROMPT = `Ты — дружелюбный и внимате�
 ...содержимое в Markdown...
 </file>
 Правила по типам:
-- docx: заголовки #, ##, ###; абзацы; списки «- » и «1. »; таблицы Markdown; **жирный**, *курсив*. Для учебных работ по требованиям (ГОСТ, «14 шрифт») добавь атрибуты: <file type="docx" name="Реферат.docx" font="Times New Roman" size="14">. Пиши полный текст документа, а не план.
-- xlsx: каждый лист начинается строкой «## Название листа», дальше таблица Markdown; первая строка — заголовки. В ячейках — чистые числа без единиц (единицы пиши в заголовке), проценты как 15%. Формулы начинаются с «=» и пишутся по-английски через запятую: =SUM(B2:B10), =AVERAGE(C2:C5), =B2*C2, =IF(B2>0,"да","нет"). Первая строка данных — строка 2.
+- docx: документ оформляется автоматически. Первая строка «# Название» — титул, 1–2 строки под ним — подзаголовок (автор, предмет, дата). Дальше разделы «## », подразделы «### », абзацы, списки «- » и «1. », таблицы Markdown, **жирный**, *курсив*, цитаты/важные замечания строкой «> ». Строка «**Ответ:** …» (или «Итог:», «Вывод:») выделяется рамкой. Формулы — отдельной строкой, они встанут по центру. «@toc» — содержание, «@pagebreak» — новая страница.
+  Оформление: для рефератов, докладов, курсовых и всего, где нужны требования вуза/школы, ставь style="gost" (Times New Roman 14, интервал 1,5, поля 30/15/20/20, по ширине, номера страниц): <file type="docx" name="Реферат.docx" style="gost">. Иначе — цветная тема theme (те же, что для презентаций: ocean, sunset, forest, lavender, minimal, classic). Можно задать font="..." size="...". Пиши полный текст документа, а не план.
+- xlsx: таблица оформляется автоматически (цветная шапка, полосы, рамки, фильтр, закреплённая шапка). Укажи theme (как у презентаций). Каждый лист начинается строкой «## Название листа», дальше таблица Markdown; первая строка — заголовки. В ячейках — чистые числа без единиц: единицы пиши в заголовке («Сумма, ₽» — тогда числа станут рублями), проценты как 15%, даты как 15.03.2026. Строка, начинающаяся с «Итого»/«Всего», выделяется как итоговая. Формулы начинаются с «=» и пишутся по-английски через запятую: =SUM(B2:B10), =AVERAGE(C2:C5), =B2*C2, =IF(B2>0,"да","нет"); первая строка данных — строка 2.
+  Диаграмма: строка после таблицы «@chart: column» (или bar, line, pie); можно уточнить «@chart: line; columns: B,C; title: Динамика». Категории берутся из столбца A, строка «Итого» в диаграмму не попадает. Добавляй диаграмму, когда данные просят визуализации (динамика, структура, сравнение).
 - pptx: презентация оформляется автоматически в красивом дизайне. Укажи тему атрибутом theme: ocean (синяя деловая), sunset (тёплая), forest (зелёная), lavender (нежная фиолетовая), minimal (строгая бело-красная), night (тёмная), classic (классика с золотом, для истории и литературы). Выбери тему под содержание или по просьбе пользователя.
   Слайды разделяй строкой «---». Каждый слайд — «# Заголовок», затем содержимое. Тип слайда можно задать строкой «@layout: тип» перед заголовком; если не задан, он определяется сам:
   · первый слайд — титульный: заголовок + строка подзаголовка (автор, предмет);
@@ -69,7 +72,23 @@ export const SYSTEM_PROMPT = `Ты — дружелюбный и внимате�
 - Внутри файла тоже никакого LaTeX — только Unicode.
 - Вне блока напиши одно-два предложения о том, что в файле. Не дублируй содержимое файла в сообщении.
 - PDF создать не можешь — предложи Word (на телефоне его можно сохранить как PDF через «Поделиться → Напечатать»).
-- Если просят изменить уже созданный файл — пришли новый блок <file> с исправленным полным содержимым.
+
+Оформление по просьбе пользователя — выполняй его буквально, атрибутами блока <file> (для всех трёх типов):
+primary="…" (основной цвет: заголовки, шапки таблиц, фон титульного слайда), accent="…" (акцент: линии, маркеры, выделения), bg="…" (фон слайдов; тёмный фон → светлый текст), text="…" (цвет текста), heading="…" (цвет заголовков), font="…" (шрифт текста), headfont="…" (шрифт заголовков), size="…" (размер текста в Word), spacing="1.5" (межстрочный интервал в Word), align="justify|left|center" (выравнивание в Word), indent="1.25" (абзацный отступ в см). Цвета — HEX (#C62828) или словами (красный, тёмно-синий, бордовый, мятный, золотой…). Просьбу «красные заголовки, шрифт Arial 12» переводи в heading="красный" font="Arial" size="12". Свои атрибуты сочетаются с theme и style="gost".
+
+Доработка созданного тобой файла: если просят что-то поменять в файле, который ты сделал раньше (тебе будет показан его полный исходник), пришли новый полный блок <file> с тем же type и name и учти просьбу (цвета, слайды, строки, текст…). Не пиши «я изменил», не прислав файл.
+
+Правка ПРИСЛАННОГО пользователем Word/Excel/PowerPoint с сохранением его оформления: если просят исправить, дописать, удалить, поменять текст или цифры в их файле — НЕ создавай новый файл, а верни блок правок:
+<edit file="имя файла">
+replace P12: новый текст абзаца
+after P12: новый абзац после P12 (можно «## Заголовок», «- пункт списка», **жирный**; несколько строк — несколько абзацев)
+before P3: абзац перед P3
+delete P15            (или диапазон: delete P15-P18)
+find: старый текст => новый текст      (замена во всём файле: опечатки, имена, числа)
+append: абзац в конец документа
+</edit>
+Для PowerPoint адреса вида S2P3 (слайд 2, абзац 3), те же команды, плюс «delete slide 4». Для Excel: «sheet: Имя листа», затем «set B5: 123», «set D7: =SUM(D2:D6)», «set A8: текст», «clear B5» или «clear B5:D9»; можно «set 'Лист 2'!C3: 10». Новые строки — просто записывай ячейки в пустые строки ниже.
+Адреса бери только из присланного документа ([P…], [S…P…], адреса ячеек). Мелкие правки — find/replace; переписать абзац — replace. Вне блока коротко перечисли, что изменил. Если просят полностью переделать или красиво переоформить их файл — тогда создай новый файл блоком <file>, взяв содержание из присланного.
 
 Не представляйся и не называй свою модель, пока об этом не спросят. Не выдумывай факты; если не уверен — скажи об этом.`;
 
@@ -246,6 +265,10 @@ export function extractRequest(msg) {
 export function historyKey(uid) {
   return `history:${uid}`;
 }
+export function genKey(uid) {
+  return `lastgen:${uid}`;
+}
+const LAST_GEN_TTL = 7 * 24 * 3600; // a file the bot made can be reworked for a week
 export function fileKey(uid) {
   return `lastfile:${uid}`;
 }
@@ -364,6 +387,21 @@ async function getImage(telegram, env, fetchImpl, fileId, mimeHint) {
 }
 
 // Loads a document: PDFs become a model attachment, others become text.
+// Text the model sees. Word and PowerPoint get [P12]/[S2P3] addresses for edits.
+async function describeDocument(kind, name, data) {
+  if (kind === "docx" || kind === "pptx") {
+    let text = kind === "docx" ? await docxForEdit(data) : await pptxForEdit(data);
+    const truncated = text.length > MAX_EXTRACT_CHARS;
+    if (truncated) text = text.slice(0, MAX_EXTRACT_CHARS) + "\n[… файл обрезан …]";
+    const note = kind === "docx"
+      ? "Абзацы пронумерованы [P…] — это адреса для правок; «#» — заголовок, «- » — пункт списка. Картинки не показаны, но в файле сохраняются."
+      : "Абзацы слайдов пронумерованы [S<слайд>P<абзац>] — это адреса для правок.";
+    return { name, kind, text, note, truncated };
+  }
+  const r = await extractDocument(kind, name, data);
+  return { name, kind, text: r.text, note: r.note, truncated: r.truncated };
+}
+
 async function loadDocument(ctx, file) {
   const { telegram, env, fetchImpl } = ctx;
   if (file.kind === "pdf") {
@@ -372,13 +410,13 @@ async function loadDocument(ctx, file) {
   }
   const data = await downloadFile(telegram, env, fetchImpl, file.fileId, MAX_FILE_SIZE, "file_too_large");
   try {
-    const r = await extractDocument(file.kind, file.name, data);
-    return { name: file.name, kind: file.kind, text: r.text, note: r.note, truncated: r.truncated };
+    return await describeDocument(file.kind, file.name, data);
   } catch (err) {
     throw new ModelError(err.message === "file_too_large" ? "file_too_large" : "file_parse_failed");
   }
 }
 
+const EDIT_WORDS = /измени|поменя|исправ|поправ|замени|добав|допиш|убер|удали|сократ|расшир|перепиш|переделай|отредакт|сделай (?:его|её|ее)|в (?:этом|моём|моем) файле|цвет|шрифт|фон|оформ|стил|крупнее|меньше|больше слайд/i;
 const FILE_WORDS = /ворд|word|docx|документ|реферат|доклад|эссе|сочинени|отч[её]т|эксел|excel|xlsx|таблиц|презентац|слайд|pptx|powerpoint|файл/i;
 
 function documentPrompt(doc, followUp) {
@@ -419,11 +457,39 @@ export async function sendFile(telegram, chatId, name, mime, bytes, caption) {
 }
 
 /**
- * Sends an answer: text as formatted messages, <file> blocks as documents.
+ * Sends an answer: text as formatted messages, <file> blocks as new documents,
+ * <edit> blocks applied to the user's last file (same formatting kept).
  */
-export async function deliver(telegram, chatId, answer, replyTo) {
-  const { text, files } = extractFileBlocks(answer);
-  if (text || !files.length) await sendFormatted(telegram, chatId, text || answer, replyTo);
+export async function deliver(ctx, uid, chatId, answer, replyTo) {
+  const { telegram, kv } = ctx;
+  const edited = extractEditBlocks(answer);
+  const { text, files } = extractFileBlocks(edited.text);
+  const notes = [];
+  // edits of the user's own file
+  for (const e of edited.edits) {
+    const last = kv ? await kv.get(fileKey(uid), "json").catch(() => null) : null;
+    const kind = last && editKindOf(last.name);
+    if (!last?.fileId || !kind) { notes.push("⚠️ Не нашёл файл для правки — пришли его ещё раз."); continue; }
+    try {
+      const original = await downloadFile(telegram, ctx.env, ctx.fetchImpl, last.fileId, MAX_FILE_SIZE, "file_too_large");
+      const { bytes, report } = await applyEdits(kind, original, e.ops);
+      const sent = await sendFile(telegram, chatId, last.name, MIME[kind], bytes,
+        `✏️ Правок внесено: ${report.applied}${report.missing.length ? ` · не найдено: ${report.missing.slice(0, 5).join(", ")}` : ""}`);
+      log("file_edited", { kind, applied: report.applied, missing: report.missing.length });
+      // the edited version becomes the file for the next edits
+      const newId = sent?.document?.file_id;
+      if (newId) {
+        const doc = await describeDocument(kind, last.name, bytes).catch(() => null);
+        await kv.put(fileKey(uid), JSON.stringify({ ...last, fileId: newId, text: doc ? doc.text.slice(0, MAX_LAST_FILE_CHARS) : last.text, ts: Date.now() }), { expirationTtl: LAST_FILE_TTL }).catch(() => {});
+      }
+    } catch (err) {
+      if (err instanceof TelegramError && err.status >= 500) throw err;
+      log("edit_error", { message: String(err?.message || "").slice(0, 200) });
+      notes.push("⚠️ Не получилось применить правки к файлу. Попробуй сформулировать иначе или пришли файл ещё раз.");
+    }
+  }
+  const message = [text, ...notes].filter(Boolean).join("\n\n");
+  if (message || (!files.length && !edited.edits.length)) await sendFormatted(telegram, chatId, message || answer, replyTo);
   for (const f of files) {
     let bytes;
     try { bytes = buildFile(f); }
@@ -434,6 +500,8 @@ export async function deliver(telegram, chatId, answer, replyTo) {
     }
     await sendFile(telegram, chatId, f.name, MIME[f.type], bytes);
     log("file_sent", { type: f.type, bytes: bytes.length });
+    // keep the full source so the file can be reworked on request
+    if (kv) await kv.put(genKey(uid), JSON.stringify({ type: f.type, name: f.name, attrs: f.attrs || {}, content: f.content.slice(0, 60_000), ts: Date.now() }), { expirationTtl: LAST_GEN_TTL }).catch(() => {});
   }
 }
 
@@ -466,18 +534,30 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
       prefix = documentPrompt(doc, false);
       // Remember the document for follow-up questions (one KV write per file).
       const keep = doc.kind === "pdf"
-        ? { name: doc.name, kind: "pdf", fileId: req.file.fileId }
-        : { name: doc.name, kind: doc.kind, text: doc.text.slice(0, MAX_LAST_FILE_CHARS), note: doc.note };
+        ? { name: doc.name, kind: "pdf", fileId: req.file.fileId, ts: Date.now() }
+        : { name: doc.name, kind: doc.kind, fileId: req.file.fileId, text: doc.text.slice(0, MAX_LAST_FILE_CHARS), note: doc.note, ts: Date.now() };
       await kv.put(fileKey(uid), JSON.stringify(keep), { expirationTtl: LAST_FILE_TTL }).catch(() => {});
     } else if (!req.image) {
-      const last = await kv.get(fileKey(uid), "json").catch(() => null);
+      const [last, gen] = await Promise.all([
+        kv.get(fileKey(uid), "json").catch(() => null),
+        kv.get(genKey(uid), "json").catch(() => null),
+      ]);
+      const parts = [];
       if (last?.kind === "pdf" && last.fileId) {
         const doc = await loadDocument(ctx, { fileId: last.fileId, name: last.name, kind: "pdf" }).catch(() => null);
-        if (doc) { attachment = doc.attachment; prefix = documentPrompt(doc, true); }
+        if (doc) { attachment = doc.attachment; parts.push(documentPrompt(doc, true)); }
       } else if (last?.text) {
-        prefix = documentPrompt(last, true);
+        parts.push(documentPrompt(last, true));
       }
+      // the bot's own last file: only when the message is about changing/making files
+      if (gen && (EDIT_WORDS.test(req.text) || FILE_WORDS.test(req.text)) && (!last || (gen.ts || 0) >= (last.ts || 0) || /презентац|слайд|таблиц|эксел|excel/i.test(req.text))) {
+        const attrs = Object.entries(gen.attrs || {}).filter(([k]) => k !== "type" && k !== "name").map(([k, v]) => ` ${k}="${String(v).replace(/"/g, "'")}"`).join("");
+        parts.push(`(Последний файл, который ты создал: «${gen.name}». Его полный исходник ниже. Если просят изменить ЭТОТ файл — пришли новый полный блок <file> с тем же type и name и с учётом просьбы.)\n<file type="${gen.type}" name="${gen.name}"${attrs}>\n${gen.content}\n</file>`);
+        req.wantsFile = true;
+      }
+      prefix = parts.join("\n\n");
     }
+    if (req.file && EDIT_WORDS.test(req.text)) req.wantsFile = true;
     const question = userPrompt(req);
     result = await askModel(env, {
       system: SYSTEM_PROMPT,
@@ -512,7 +592,7 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
   await saveRecord(kv, uid, rec);
 
   try {
-    await deliver(telegram, chatId, answer, replyTo);
+    await deliver(ctx, uid, chatId, answer, replyTo);
     return "ok";
   } catch (err) {
     log("deliver_error", { message: err.message });
@@ -536,7 +616,7 @@ async function exportLastAnswer(ctx, uid, chatId) {
   const source = docx ? docx.content : text.replace(/\n\n\*Ответ получился очень длинным[\s\S]*$/, "");
   const firstLine = (source.split("\n").find(l => l.trim()) || "").replace(/^#+\s*|\*\*/g, "").trim();
   const name = safeFileName(docx?.name || firstLine.slice(0, 50) || "Ответ", "docx");
-  const bytes = buildDocx(source, { font: docx?.font, size: docx?.size });
+  const bytes = buildDocx(source, { font: docx?.font, size: docx?.size, theme: docx?.theme, style: docx?.style });
   await sendFile(ctx.telegram, chatId, name, MIME.docx, bytes);
 }
 
@@ -580,6 +660,7 @@ export async function handleUpdate(update, ctx) {
     // Only the caller's own keys, derived from the verified sender ID.
     await kv.delete(historyKey(uid));
     await kv.delete(fileKey(uid));
+    await kv.delete(genKey(uid));
     await telegram("sendMessage", { chat_id: chatId, text: "🧹 Твоя история очищена, присланный файл забыт. Начинаем с чистого листа." });
     return "ok";
   }
@@ -600,7 +681,7 @@ export async function handleUpdate(update, ctx) {
     if (rec.lastUpdateId === updateId) {
       if (rec.undelivered) {
         try {
-          await deliver(telegram, rec.undelivered.chatId, rec.undelivered.text);
+          await deliver(ctx, uid, rec.undelivered.chatId, rec.undelivered.text);
           delete rec.undelivered;
           await saveRecord(kv, uid, rec);
           return "ok";

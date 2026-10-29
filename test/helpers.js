@@ -53,7 +53,10 @@ export function makeFetch({ model, telegram, files = {} } = {}) {
         }
         calls.uploads.push({ method, fields, file });
         calls.telegram.push({ method, body: fields });
-        return Response.json({ ok: true, result: { message_id: 2 } });
+        // uploaded documents become downloadable again under a new file_id
+        const newId = `up${calls.uploads.length}`;
+        if (file) files[newId] = file.bytes;
+        return Response.json({ ok: true, result: { message_id: 2, document: { file_id: newId, file_name: file?.name } } });
       }
       const body = init.body ? JSON.parse(init.body) : {};
       calls.telegram.push({ method, body });

@@ -22,31 +22,9 @@ import { createZip } from "./zip.js";
 import { xml, prepare, inlineRuns, isTableRow, isSeparator, splitRow } from "./markdown.js";
 import * as T from "./pptx-template.js";
 
-/* ------------------------------ themes ------------------------------ */
+import { THEMES, pickTheme, resolveTheme, luminance } from "./theme.js";
 
-export const THEMES = {
-  ocean:    { dark: "0B2545", primary: "13315C", accent: "2EC4B6", accent2: "8DA9C4", bg: "F6F9FC", card: "FFFFFF", text: "1B2A41", heading: "13315C", muted: "5C6B7A", onDark: "FFFFFF", onDarkMuted: "B9CCE0", line: "D9E2EC", font: "Calibri", headFont: "Calibri" },
-  sunset:   { dark: "3A1F33", primary: "B33F62", accent: "F9A03F", accent2: "F4D35E", bg: "FFF8F1", card: "FFFFFF", text: "2D1E2F", heading: "8E2C4E", muted: "7A6670", onDark: "FFFFFF", onDarkMuted: "F2C9B8", line: "F0DCCF", font: "Calibri", headFont: "Calibri" },
-  forest:   { dark: "17332A", primary: "2F6B4F", accent: "D4A72C", accent2: "8FBC94", bg: "F5F8F2", card: "FFFFFF", text: "1E2B24", heading: "245640", muted: "5F6F66", onDark: "FFFFFF", onDarkMuted: "C2D8C9", line: "DCE6DA", font: "Calibri", headFont: "Calibri" },
-  minimal:  { dark: "111111", primary: "1F1F1F", accent: "E63946", accent2: "A8A8A8", bg: "FFFFFF", card: "F5F5F5", text: "1F1F1F", heading: "111111", muted: "6B6B6B", onDark: "FFFFFF", onDarkMuted: "C9C9C9", line: "E5E5E5", font: "Calibri", headFont: "Calibri" },
-  lavender: { dark: "2E1A47", primary: "5A3E85", accent: "F28482", accent2: "B8A1D9", bg: "F8F5FC", card: "FFFFFF", text: "2A2140", heading: "4A2F75", muted: "6E6483", onDark: "FFFFFF", onDarkMuted: "D3C4EA", line: "E6DDF2", font: "Calibri", headFont: "Calibri" },
-  night:    { dark: "0B1120", primary: "1E293B", accent: "38BDF8", accent2: "A78BFA", bg: "0F172A", card: "1E293B", text: "E2E8F0", heading: "F8FAFC", muted: "94A3B8", onDark: "F8FAFC", onDarkMuted: "94A3B8", line: "334155", font: "Calibri", headFont: "Calibri", darkContent: true },
-  classic:  { dark: "1C2541", primary: "1C2541", accent: "C9A227", accent2: "8C9AB8", bg: "FBF9F4", card: "FFFFFF", text: "1C2541", heading: "1C2541", muted: "6A6F7E", onDark: "FFFFFF", onDarkMuted: "D8CFAF", line: "E7E1D2", font: "Calibri", headFont: "Georgia" },
-};
-const THEME_ALIASES = {
-  blue: "ocean", синяя: "ocean", синий: "ocean", океан: "ocean", business: "ocean", деловая: "ocean",
-  warm: "sunset", тёплая: "sunset", теплая: "sunset", закат: "sunset", red: "sunset", orange: "sunset",
-  green: "forest", зелёная: "forest", зеленая: "forest", природа: "forest", eco: "forest",
-  white: "minimal", минимализм: "minimal", строгая: "minimal", black: "minimal",
-  purple: "lavender", фиолетовая: "lavender", лавандовая: "lavender", pink: "lavender", нежная: "lavender",
-  dark: "night", тёмная: "night", темная: "night", ночь: "night", tech: "night",
-  gold: "classic", классика: "classic", классическая: "classic", history: "classic", история: "classic",
-};
-
-export function pickTheme(name) {
-  const n = String(name || "").toLowerCase().trim();
-  return THEMES[n] ? n : THEME_ALIASES[n] || "ocean";
-}
+export { THEMES, pickTheme, resolveTheme };
 
 /* ------------------------------ geometry & XML ------------------------------ */
 
@@ -414,7 +392,8 @@ function layoutCover(c, t, s, ending) {
 }
 
 function layoutSection(c, t, s, sectionNo) {
-  c.shape(0, 0, W, H, { fill: t.darkContent ? t.dark : t.primary, name: "Background" });
+  const secBg = luminance(t.primary) < 0.42 && t.primary !== t.card ? t.primary : t.dark;
+  c.shape(0, 0, W, H, { fill: secBg, name: "Background" });
   c.shape(0, 0, 0.35, H, { fill: t.accent, name: "Side" });
   c.text(0.95, 1.3, 4, 1.8, [{ text: String(sectionNo).padStart(2, "0"), size: 88, bold: true, color: t.accent, font: t.headFont }], { anchor: "b" });
   const ts = fitSize([s.title], 11, 2.2, 46, 26, { bold: true, font: t.headFont });
@@ -425,13 +404,12 @@ function layoutSection(c, t, s, sectionNo) {
 
 /* ------------------------------ build ------------------------------ */
 
-export function renderSlide(s, k, total, theme, sectionNo) {
-  const t = THEMES[theme];
+export function renderSlide(s, k, total, t, sectionNo) {
   const layout = inferLayout(s, k, total);
   const c = new Canvas(t);
   let bg = t.bg;
   if (layout === "title" || layout === "ending") { layoutCover(c, t, s, layout === "ending"); bg = t.dark; }
-  else if (layout === "section") { layoutSection(c, t, s, sectionNo); bg = t.primary; }
+  else if (layout === "section") { layoutSection(c, t, s, sectionNo); bg = t.dark; }
   else if (layout === "quote") { layoutQuote(c, t, s); bg = t.dark; }
   else {
     if (s.title && layout !== "big-number") headerBlock(c, t, s, k + 1);
@@ -472,15 +450,15 @@ export function splitOverfull(slides) {
   return out;
 }
 
-export function buildPptx(markdown, { theme } = {}) {
-  const themeName = pickTheme(theme);
+export function buildPptx(markdown, attrs = {}) {
+  const themeObj = resolveTheme(attrs);
   let slides = splitOverfull(parseDeck(prepare(markdown))).slice(0, 40);
   if (!slides.length) slides = [{ ...parseDeck("# Презентация")[0] }];
   let sectionNo = 0;
   const rendered = slides.map((s, k) => {
     const layout = inferLayout(s, k, slides.length);
     if (layout === "section") sectionNo++;
-    return renderSlide(s, k, slides.length, themeName, sectionNo);
+    return renderSlide(s, k, slides.length, themeObj, sectionNo);
   });
   const rels = (target, type) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${REL}/${type}" Target="${target}"/></Relationships>`;
