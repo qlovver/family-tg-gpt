@@ -53,7 +53,10 @@ export function normalizeHistory(history) {
 export function buildMessagesBody(cfg, system, history, text, image) {
   const content = [];
   if (image) {
-    content.push({ type: "image", source: { type: "base64", media_type: image.mime, data: image.base64 } });
+    // PDFs go as a "document" block, pictures as an "image" block.
+    content.push(image.mime === "application/pdf"
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: image.base64 }, ...(image.name ? { title: image.name } : {}) }
+      : { type: "image", source: { type: "base64", media_type: image.mime, data: image.base64 } });
   }
   content.push({ type: "text", text });
   return {
@@ -67,7 +70,9 @@ export function buildMessagesBody(cfg, system, history, text, image) {
 
 export function buildChatBody(cfg, system, history, text, image) {
   const content = image
-    ? [{ type: "text", text }, { type: "image_url", image_url: { url: `data:${image.mime};base64,${image.base64}` } }]
+    ? [{ type: "text", text }, image.mime === "application/pdf"
+      ? { type: "file", file: { filename: image.name || "document.pdf", file_data: `data:application/pdf;base64,${image.base64}` } }
+      : { type: "image_url", image_url: { url: `data:${image.mime};base64,${image.base64}` } }]
     : text;
   return {
     model: cfg.model,
@@ -79,7 +84,9 @@ export function buildChatBody(cfg, system, history, text, image) {
 
 export function buildResponsesBody(cfg, system, history, text, image) {
   const content = image
-    ? [{ type: "input_text", text }, { type: "input_image", image_url: `data:${image.mime};base64,${image.base64}` }]
+    ? [{ type: "input_text", text }, image.mime === "application/pdf"
+      ? { type: "input_file", filename: image.name || "document.pdf", file_data: `data:application/pdf;base64,${image.base64}` }
+      : { type: "input_image", image_url: `data:${image.mime};base64,${image.base64}` }]
     : text;
   return {
     model: cfg.model,
@@ -221,6 +228,7 @@ async function callOnce(cfg, format, env, payload, fetchImpl, signal) {
 export async function askModel(env, payload, { fetchImpl = fetch, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   if (!env.TOOKEN_API_KEY) throw new ModelError("auth_failed", "TOOKEN_API_KEY is not set");
   const cfg = modelConfig(env);
+  if (Number(payload.maxTokens) > 0) cfg.maxTokens = Number(payload.maxTokens);
   const started = Date.now();
   // AbortController + setTimeout (works in Workers and Node; cleared on finish).
   const controller = new AbortController();

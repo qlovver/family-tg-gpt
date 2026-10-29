@@ -31,22 +31,39 @@ export function makeEnv(extra = {}) {
  * Fake fetch. `model` is a function (url, body, init) => Response-like
  * description: { status, json } | { status, text, contentType }.
  */
-export function makeFetch({ model, telegram } = {}) {
-  const calls = { telegram: [], model: [], files: [] };
+export function makeFetch({ model, telegram, files = {} } = {}) {
+  const calls = { telegram: [], model: [], files: [], uploads: [] };
   const fn = async (url, init = {}) => {
     url = String(url);
     if (url.startsWith("https://api.telegram.org/file/")) {
       calls.files.push(url);
+      const id = url.split("/").pop();
+      if (files[id]) return new Response(files[id], { status: 200 });
       const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
       return new Response(jpeg, { status: 200 });
     }
     if (url.startsWith("https://api.telegram.org/bot")) {
       const method = url.split("/").pop();
+      if (init.body instanceof FormData) {
+        const fields = {};
+        let file = null;
+        for (const [k, v] of init.body.entries()) {
+          if (typeof v === "string") fields[k] = v;
+          else file = { field: k, name: v.name, type: v.type, bytes: new Uint8Array(await v.arrayBuffer()) };
+        }
+        calls.uploads.push({ method, fields, file });
+        calls.telegram.push({ method, body: fields });
+        return Response.json({ ok: true, result: { message_id: 2 } });
+      }
       const body = init.body ? JSON.parse(init.body) : {};
       calls.telegram.push({ method, body });
       const custom = telegram?.(method, body);
       if (custom) return new Response(JSON.stringify(custom.json), { status: custom.status || 200 });
-      if (method === "getFile") return Response.json({ ok: true, result: { file_path: "photos/a.jpg", file_size: 8 } });
+      if (method === "getFile") {
+        const id = body.file_id;
+        const size = files[id] ? files[id].length : 8;
+        return Response.json({ ok: true, result: { file_path: files[id] ? `documents/${id}` : "photos/a.jpg", file_size: size } });
+      }
       return Response.json({ ok: true, result: method === "sendMessage" ? { message_id: 1 } : true });
     }
     if (url.startsWith("https://tooken.club/")) {
@@ -104,4 +121,14 @@ export const execCtx = { waitUntil() {} };
 
 export function sentTexts(calls) {
   return calls.telegram.filter(c => c.method === "sendMessage").map(c => c.body.text);
+}
+
+export function documentUpdate(uid, fileId, fileName, mime, caption) {
+  return {
+    update_id: ++updateSeq,
+    message: {
+      message_id: updateSeq, from: { id: uid }, chat: { id: uid, type: "private" }, caption,
+      document: { file_id: fileId, file_name: fileName, mime_type: mime, file_size: 1000 },
+    },
+  };
 }

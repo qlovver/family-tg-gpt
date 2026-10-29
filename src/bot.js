@@ -6,6 +6,8 @@
 
 import { toTelegramHtml, splitHtml, htmlToPlain, escapeHtml } from "./format.js";
 import { askModel, ModelError, modelConfig } from "./model.js";
+import { classifyDocument, extractDocument, base64FromBytes, MAX_FILE_SIZE, MAX_PDF_SIZE } from "./files.js";
+import { extractFileBlocks, buildFile, buildDocx, safeFileName, MIME } from "./build.js";
 
 export const MAX_IMAGE_SIZE = 2_500_000;      // bytes, after Telegram compression
 export const MAX_IMAGE_SIDE = 1600;           // px; Claude downsizes larger images anyway
@@ -39,6 +41,23 @@ export const SYSTEM_PROMPT = `Ты — дружелюбный и внимате�
 - Можно использовать простую разметку: **жирный**, *курсив*, заголовки через ##, списки через «- » или «1. », \`код\`. Таблицы — только маленькие.
 - Не злоупотребляй жирным: выделяй подписи шагов и итоговый ответ.
 - Десятичные числа пиши с запятой (0,5), если собеседник сам не использует точку.
+
+Файлы, которые присылают:
+- Содержимое Word, Excel, PowerPoint и текстовых файлов приходит в теге <document>; PDF приходит вложением. Картинки внутри Word/PowerPoint тебе не видны — если без них не понять задание, скажи об этом.
+- Отвечай по содержимому файла; ссылайся на разделы, страницы, слайды или ячейки, где это помогает.
+
+Создание файлов (Word, Excel, PowerPoint). Делай файл ТОЛЬКО когда об этом просят («в ворде», «документом», «таблицей в экселе», «презентацию» и т.п.) или когда без файла никак. Файл оформляется блоком:
+<file type="docx" name="Название.docx">
+...содержимое в Markdown...
+</file>
+Правила по типам:
+- docx: заголовки #, ##, ###; абзацы; списки «- » и «1. »; таблицы Markdown; **жирный**, *курсив*. Для учебных работ по требованиям (ГОСТ, «14 шрифт») добавь атрибуты: <file type="docx" name="Реферат.docx" font="Times New Roman" size="14">. Пиши полный текст документа, а не план.
+- xlsx: каждый лист начинается строкой «## Название листа», дальше таблица Markdown; первая строка — заголовки. В ячейках — чистые числа без единиц (единицы пиши в заголовке), проценты как 15%. Формулы начинаются с «=» и пишутся по-английски через запятую: =SUM(B2:B10), =AVERAGE(C2:C5), =B2*C2, =IF(B2>0,"да","нет"). Первая строка данных — строка 2.
+- pptx: каждый слайд начинается с «# Заголовок слайда», дальше 3–6 коротких пунктов «- ». Первый слайд — титульный: заголовок и одна строка подзаголовка. Слайды разделяй строкой «---».
+- Внутри файла тоже никакого LaTeX — только Unicode.
+- Вне блока напиши одно-два предложения о том, что в файле. Не дублируй содержимое файла в сообщении.
+- PDF создать не можешь — предложи Word (на телефоне его можно сохранить как PDF через «Поделиться → Напечатать»).
+- Если просят изменить уже созданный файл — пришли новый блок <file> с исправленным полным содержимым.
 
 Не представляйся и не называй свою модель, пока об этом не спросят. Не выдумывай факты; если не уверен — скажи об этом.`;
 
@@ -89,9 +108,12 @@ export class TelegramError extends Error {
   }
 }
 
+// TELEGRAM_API_URL is only for local tests against a mock server.
+const tgBase = env => String(env.TELEGRAM_API_URL || "https://api.telegram.org").replace(/\/+$/, "");
+
 export function makeTelegram(env, fetchImpl) {
-  return async function telegram(method, payload) {
-    const res = await fetchImpl(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+  async function telegram(method, payload) {
+    const res = await fetchImpl(`${tgBase(env)}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -100,7 +122,19 @@ export function makeTelegram(env, fetchImpl) {
     try { data = await res.json(); } catch { /* ignore */ }
     if (!res.ok || !data.ok) throw new TelegramError(method, res.status, String(data.description || "unknown").slice(0, 200));
     return data.result;
+  }
+  // multipart/form-data upload (sendDocument)
+  telegram.upload = async function upload(method, fields, file) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.append(k, typeof v === "string" ? v : JSON.stringify(v));
+    form.append(file.field, new Blob([file.bytes], { type: file.mime }), file.name);
+    const res = await fetchImpl(`${tgBase(env)}/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, { method: "POST", body: form });
+    let data = {};
+    try { data = await res.json(); } catch { /* ignore */ }
+    if (!res.ok || !data.ok) throw new TelegramError(method, res.status, String(data.description || "unknown").slice(0, 200));
+    return data.result;
   };
+  return telegram;
 }
 
 /**
@@ -132,10 +166,7 @@ async function sendHtml(telegram, chatId, htmlText) {
 }
 
 export function imageToBase64(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  return btoa(bin);
+  return base64FromBytes(new Uint8Array(arrayBuffer));
 }
 
 export function detectMime(bytes, fallback = "image/jpeg") {
@@ -160,37 +191,42 @@ export function pickPhoto(sizes) {
 
 const IMAGE_MIMES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 
+// What a message carries besides text: a photo/image, or a document file.
+function attachmentOf(m) {
+  if (m.photo?.length) {
+    const p = pickPhoto(m.photo);
+    if (!p) return { error: "image_too_large" };
+    return { image: { fileId: p.file_id, mime: "image/jpeg" } };
+  }
+  if (m.document) {
+    const c = classifyDocument(m.document);
+    if (c.error) return { error: c.error, hint: c.hint };
+    if (c.kind === "image") {
+      if (m.document.file_size && m.document.file_size > MAX_IMAGE_SIZE) return { error: "image_too_large" };
+      return { image: { fileId: m.document.file_id, mime: IMAGE_MIMES.includes(c.mime) ? c.mime : "image/jpeg" } };
+    }
+    return { file: { fileId: m.document.file_id, name: c.name, kind: c.kind } };
+  }
+  return {};
+}
+
 // Extracts what we need to call the model from a Telegram message.
 export function extractRequest(msg) {
   const text = (msg.text || msg.caption || "").trim();
-  let image = null, error = null;
-  const fromMessage = m => {
-    if (m.photo?.length) {
-      const p = pickPhoto(m.photo);
-      if (!p) return { error: "image_too_large" };
-      return { image: { fileId: p.file_id, mime: "image/jpeg" } };
-    }
-    if (m.document) {
-      const mime = m.document.mime_type || "";
-      if (!IMAGE_MIMES.includes(mime)) return { error: mime === "application/pdf" ? "pdf_unsupported" : "file_unsupported" };
-      if (m.document.file_size && m.document.file_size > MAX_IMAGE_SIZE) return { error: "image_too_large" };
-      return { image: { fileId: m.document.file_id, mime } };
-    }
-    return {};
-  };
-  ({ image, error } = fromMessage(msg));
-  let quoted = "";
+  const own = attachmentOf(msg);
+  const req = { text: text.slice(0, MAX_USER_CHARS), image: own.image || null, file: own.file || null, error: own.error || null, hint: own.hint, quoted: "" };
   const r = msg.reply_to_message;
   if (r) {
-    // Replying to an earlier photo with a question re-uses that photo.
-    if (!image && !error) {
-      const fromReply = fromMessage(r);
-      if (fromReply.image) image = { ...fromReply.image, fromReply: true };
+    // Replying to an earlier photo/file with a question re-uses it.
+    if (!req.image && !req.file && !req.error) {
+      const fromReply = attachmentOf(r);
+      if (fromReply.image) req.image = { ...fromReply.image, fromReply: true };
+      if (fromReply.file) req.file = { ...fromReply.file, fromReply: true };
     }
     const rt = (r.text || r.caption || "").trim();
-    if (rt) quoted = rt.slice(0, 1200);
+    if (rt) req.quoted = rt.slice(0, 1200);
   }
-  return { text: text.slice(0, MAX_USER_CHARS), image, error, quoted };
+  return req;
 }
 
 /* ============================== history ============================== */
@@ -198,6 +234,11 @@ export function extractRequest(msg) {
 export function historyKey(uid) {
   return `history:${uid}`;
 }
+export function fileKey(uid) {
+  return `lastfile:${uid}`;
+}
+const LAST_FILE_TTL = 6 * 3600; // a sent document stays in context for 6 hours
+const MAX_LAST_FILE_CHARS = 60_000;
 
 export async function loadRecord(kv, uid) {
   const raw = await kv.get(historyKey(uid), "json");
@@ -224,18 +265,23 @@ const HELP = `<b>Привет! Я ИИ-помощник 🤖</b>
 
 Пиши вопрос текстом или присылай <b>фото задания</b> — разберу и решу по шагам.
 
+<b>Файлы</b>
+• Читаю: PDF, Word, Excel, PowerPoint, текст и код, картинки.
+• Создаю: Word, Excel, PowerPoint — просто попроси: «оформи в ворде», «сделай таблицу в экселе», «сделай презентацию на 7 слайдов».
+• Присланный файл я помню 6 часов — можно задавать вопросы по нему.
+
 <b>Подсказки</b>
 • Одно фото — одно задание: так ответ точнее.
-• Можно добавить подпись к фото: «реши пункт б».
-• Чтобы спросить ещё про старое фото, ответь (reply) на него.
+• Чтобы спросить про старое фото или файл, ответь (reply) на него.
 • Если ответ оборвался — напиши «продолжи».
 
 <b>Команды</b>
-/reset — очистить историю (только свою)
+/word — прислать мой последний ответ файлом Word
+/reset — очистить историю и забыть файл (только свои)
 /retry — повторить последний неудачный запрос
 /id — узнать свой Telegram ID`;
 
-export function errorText(code) {
+export function errorText(code, hint) {
   switch (code) {
     case "timeout":
     case "upstream_timeout":
@@ -251,17 +297,28 @@ export function errorText(code) {
     case "endpoint_not_found":
     case "bad_request":
       return "⚠️ Сервис ИИ отклонил запрос (неподходящий формат). Отправь /retry; если повторится — нужна проверка настроек бота.";
+    case "pdf_rejected":
+      return "📄 Сервис ИИ не принял этот PDF. Пришли нужные страницы скриншотами или файл Word.";
     case "context_too_long":
     case "request_too_large":
-      return "📚 Запрос получился слишком большим. Отправь /reset и задай вопрос заново.";
+      return "📚 Запрос получился слишком большим. Отправь /reset или пришли файл поменьше (часть страниц).";
     case "image_too_large":
       return "🖼 Фото слишком большое. Отправь его как обычное фото (не файлом), до 2,5 МБ.";
     case "image_download_failed":
-      return "🖼 Не получилось скачать фото с серверов Telegram. Отправь его ещё раз.";
-    case "pdf_unsupported":
-      return "📄 PDF пока не поддерживается. Сделай скриншот нужной страницы и пришли как фото.";
+    case "file_download_failed":
+      return "📥 Не получилось скачать файл с серверов Telegram. Отправь его ещё раз.";
+    case "file_too_large":
+      return "📦 Файл слишком большой (Telegram отдаёт ботам файлы до 20 МБ). Пришли файл поменьше или нужную часть.";
+    case "pdf_too_large":
+      return "📄 PDF больше 10 МБ — такой я не потяну. Пришли нужные страницы отдельным PDF или скриншотами.";
+    case "legacy_format":
+      return `📎 Это старый формат, его я не читаю. Открой файл и сохрани как .${hint || "docx"} — тогда пришли снова.`;
+    case "heic_unsupported":
+      return "🖼 Формат HEIC я не читаю. Отправь фото обычным способом (не файлом) — Telegram сам переведёт его в JPG.";
+    case "file_parse_failed":
+      return "📎 Не получилось разобрать файл — возможно, он повреждён или защищён паролем.";
     case "file_unsupported":
-      return "📎 Такой файл я не читаю. Пришли текст или изображение (JPG, PNG, WEBP).";
+      return "📎 Такой тип файла я не читаю. Подходят: PDF, Word, Excel, PowerPoint, текст/код и картинки.";
     case "no_storage":
       return "🛠 Бот не настроен: нет хранилища HISTORY. Владельцу нужно проверить KV binding в Cloudflare.";
     case "no_api_key":
@@ -273,27 +330,99 @@ export function errorText(code) {
 
 /* ============================== bot core ============================== */
 
-async function getImage(telegram, env, fetchImpl, fileId, mimeHint) {
-  const f = await telegram("getFile", { file_id: fileId });
-  if (!f?.file_path) throw new ModelError("image_download_failed");
-  if (f.file_size && f.file_size > MAX_IMAGE_SIZE) throw new ModelError("image_too_large");
-  const res = await fetchImpl(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${f.file_path}`);
-  if (!res.ok) throw new ModelError("image_download_failed");
+async function downloadFile(telegram, env, fetchImpl, fileId, maxSize, tooLargeCode) {
+  let f;
+  try { f = await telegram("getFile", { file_id: fileId }); }
+  catch (err) {
+    if (err instanceof TelegramError && /too big/i.test(err.description)) throw new ModelError(tooLargeCode);
+    throw new ModelError("file_download_failed");
+  }
+  if (!f?.file_path) throw new ModelError("file_download_failed");
+  if (f.file_size && f.file_size > maxSize) throw new ModelError(tooLargeCode);
+  const res = await fetchImpl(`${tgBase(env)}/file/bot${env.TELEGRAM_BOT_TOKEN}/${f.file_path}`);
+  if (!res.ok) throw new ModelError("file_download_failed");
   const data = await res.arrayBuffer();
-  if (data.byteLength > MAX_IMAGE_SIZE) throw new ModelError("image_too_large");
+  if (data.byteLength > maxSize) throw new ModelError(tooLargeCode);
+  return data;
+}
+
+async function getImage(telegram, env, fetchImpl, fileId, mimeHint) {
+  const data = await downloadFile(telegram, env, fetchImpl, fileId, MAX_IMAGE_SIZE, "image_too_large");
   return { mime: detectMime(data, mimeHint), base64: imageToBase64(data) };
+}
+
+// Loads a document: PDFs become a model attachment, others become text.
+async function loadDocument(ctx, file) {
+  const { telegram, env, fetchImpl } = ctx;
+  if (file.kind === "pdf") {
+    const data = await downloadFile(telegram, env, fetchImpl, file.fileId, MAX_PDF_SIZE, "pdf_too_large");
+    return { name: file.name, kind: "pdf", attachment: { mime: "application/pdf", base64: base64FromBytes(data), name: file.name } };
+  }
+  const data = await downloadFile(telegram, env, fetchImpl, file.fileId, MAX_FILE_SIZE, "file_too_large");
+  try {
+    const r = await extractDocument(file.kind, file.name, data);
+    return { name: file.name, kind: file.kind, text: r.text, note: r.note, truncated: r.truncated };
+  } catch (err) {
+    throw new ModelError(err.message === "file_too_large" ? "file_too_large" : "file_parse_failed");
+  }
+}
+
+const FILE_WORDS = /ворд|word|docx|документ|реферат|доклад|эссе|сочинени|отч[её]т|эксел|excel|xlsx|таблиц|презентац|слайд|pptx|powerpoint|файл/i;
+
+function documentPrompt(doc, followUp) {
+  const head = followUp
+    ? `(Ранее в этом диалоге прислан файл «${doc.name}». Его содержимое ниже — используй его, если вопрос к нему относится.)`
+    : `Пользователь прислал файл «${doc.name}».${doc.note ? " " + doc.note : ""}${doc.truncated ? " Файл большой — передана только первая часть." : ""}`;
+  if (doc.kind === "pdf") return head + " PDF приложен к сообщению.";
+  return `${head}\n<document name="${doc.name.replace(/"/g, "'")}">\n${doc.text}\n</document>`;
 }
 
 function userPrompt(req) {
   let text = req.text;
   if (!text && req.image) text = "Реши задание на фото подробно по шагам, проверь вычисления и выдели ответ.";
-  if (req.quoted && !req.image?.fromReply) text = `(Это ответ на сообщение: «${req.quoted}»)\n\n${text}`;
+  if (!text && req.file) text = "Посмотри файл. Если это задание — реши его по шагам; если нет — кратко расскажи, что в нём, и спроси, что с ним сделать.";
+  if (req.quoted && !req.image?.fromReply && !req.file?.fromReply) text = `(Это ответ на сообщение: «${req.quoted}»)\n\n${text}`;
   return text;
 }
 
 function historyUserEntry(req) {
-  const mark = req.image ? (req.image.fromReply ? "[Вопрос по ранее присланному фото] " : "[Фото задания] ") : "";
-  return (mark + (req.text || (req.image ? "(без подписи)" : ""))).slice(0, MAX_USER_CHARS);
+  let mark = "";
+  if (req.image) mark = req.image.fromReply ? "[Вопрос по ранее присланному фото] " : "[Фото задания] ";
+  if (req.file) mark = `[Файл «${req.file.name}»] `;
+  return (mark + (req.text || (req.image || req.file ? "(без подписи)" : ""))).slice(0, MAX_USER_CHARS);
+}
+
+// Shortens file blocks so the history keeps their gist without the full size.
+function answerForHistory(answer) {
+  return answer.replace(/(<file\b[^>]*>)([\s\S]*?)(<\/file>|$)/gi, (_, open, body, close) =>
+    open + (body.length > 2500 ? body.slice(0, 2500) + "\n[… содержимое файла сокращено …]\n" : body) + (close || "</file>"))
+    .slice(0, MAX_STORED_ANSWER);
+}
+
+export async function sendFile(telegram, chatId, name, mime, bytes, caption) {
+  return telegram.upload("sendDocument", {
+    chat_id: String(chatId),
+    ...(caption ? { caption: caption.slice(0, 1000) } : {}),
+  }, { field: "document", name, mime, bytes });
+}
+
+/**
+ * Sends an answer: text as formatted messages, <file> blocks as documents.
+ */
+export async function deliver(telegram, chatId, answer, replyTo) {
+  const { text, files } = extractFileBlocks(answer);
+  if (text || !files.length) await sendFormatted(telegram, chatId, text || answer, replyTo);
+  for (const f of files) {
+    let bytes;
+    try { bytes = buildFile(f); }
+    catch (err) {
+      log("build_error", { type: f.type, message: String(err?.message || "").slice(0, 200) });
+      await sendFormatted(telegram, chatId, `Не получилось собрать файл «${f.name}». Вот его содержимое текстом:\n\n${f.content}`);
+      continue;
+    }
+    await sendFile(telegram, chatId, f.name, MIME[f.type], bytes);
+    log("file_sent", { type: f.type, bytes: bytes.length });
+  }
 }
 
 /**
@@ -306,27 +435,49 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
   let rec = await loadRecord(kv, uid);
   rec.pending = {
     updateId, startedAt: Date.now(), chatId,
-    text: req.text, quoted: req.quoted || "", image: req.image || null,
+    text: req.text, quoted: req.quoted || "", image: req.image || null, file: req.file || null,
   };
   await saveRecord(kv, uid, rec);
 
-  const typing = () => telegram("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+  const typing = () => telegram("sendChatAction", { chat_id: chatId, action: req.wantsFile ? "upload_document" : "typing" }).catch(() => {});
   typing();
   const timer = setInterval(typing, 4500);
 
   let result;
   try {
-    let image = null;
-    if (req.image) image = await getImage(telegram, env, fetchImpl, req.image.fileId, req.image.mime);
+    let attachment = null;
+    let prefix = "";
+    if (req.image) attachment = await getImage(telegram, env, fetchImpl, req.image.fileId, req.image.mime);
+    if (req.file) {
+      const doc = await loadDocument(ctx, req.file);
+      if (doc.attachment) attachment = doc.attachment;
+      prefix = documentPrompt(doc, false);
+      // Remember the document for follow-up questions (one KV write per file).
+      const keep = doc.kind === "pdf"
+        ? { name: doc.name, kind: "pdf", fileId: req.file.fileId }
+        : { name: doc.name, kind: doc.kind, text: doc.text.slice(0, MAX_LAST_FILE_CHARS), note: doc.note };
+      await kv.put(fileKey(uid), JSON.stringify(keep), { expirationTtl: LAST_FILE_TTL }).catch(() => {});
+    } else if (!req.image) {
+      const last = await kv.get(fileKey(uid), "json").catch(() => null);
+      if (last?.kind === "pdf" && last.fileId) {
+        const doc = await loadDocument(ctx, { fileId: last.fileId, name: last.name, kind: "pdf" }).catch(() => null);
+        if (doc) { attachment = doc.attachment; prefix = documentPrompt(doc, true); }
+      } else if (last?.text) {
+        prefix = documentPrompt(last, true);
+      }
+    }
+    const question = userPrompt(req);
     result = await askModel(env, {
       system: SYSTEM_PROMPT,
       history: rec.messages,
-      text: userPrompt(req),
-      image,
+      text: prefix ? `${prefix}\n\n${question}` : question,
+      image: attachment,
+      maxTokens: req.wantsFile ? 8000 : undefined,
     }, { fetchImpl, timeoutMs: ctx.modelTimeoutMs ?? MODEL_TIMEOUT_MS });
   } catch (err) {
     clearInterval(timer);
-    const code = err instanceof ModelError ? err.code : "unknown";
+    let code = err instanceof ModelError ? err.code : "unknown";
+    if (code === "bad_request" && req.file?.kind === "pdf") code = "pdf_rejected";
     if (!(err instanceof ModelError)) log("request_error", { name: err?.name, message: String(err?.message || "").slice(0, 200) });
     await telegram("sendMessage", { chat_id: chatId, text: errorText(code) }).catch(e => log("send_error", { message: e.message }));
     return "failed";
@@ -341,7 +492,7 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
   rec.messages = trimHistory([
     ...rec.messages,
     { role: "user", content: historyUserEntry(req) },
-    { role: "assistant", content: answer.slice(0, MAX_STORED_ANSWER) },
+    { role: "assistant", content: answerForHistory(answer) },
   ]);
   if (rec.pending?.updateId === updateId) delete rec.pending;
   rec.lastUpdateId = updateId;
@@ -349,15 +500,32 @@ async function runRequest(ctx, uid, chatId, updateId, req, replyTo) {
   await saveRecord(kv, uid, rec);
 
   try {
-    await sendFormatted(telegram, chatId, answer, replyTo);
+    await deliver(telegram, chatId, answer, replyTo);
     return "ok";
   } catch (err) {
     log("deliver_error", { message: err.message });
     // Answer is saved; remember to resend it when Telegram retries the update.
-    rec.undelivered = { chatId, text: answer };
+    rec.undelivered = { chatId, text: answer.slice(0, 100_000) };
     await saveRecord(kv, uid, rec).catch(() => {});
     return "undelivered";
   }
+}
+
+/** /word: sends the user's last answer as a Word file, without calling the model. */
+async function exportLastAnswer(ctx, uid, chatId) {
+  const rec = await loadRecord(ctx.kv, uid);
+  const last = [...rec.messages].reverse().find(m => m.role === "assistant");
+  if (!last) {
+    await ctx.telegram("sendMessage", { chat_id: chatId, text: "Пока нечего сохранять: сначала задай вопрос 🙂" });
+    return;
+  }
+  const { text, files } = extractFileBlocks(last.content);
+  const docx = files.find(f => f.type === "docx");
+  const source = docx ? docx.content : text.replace(/\n\n\*Ответ получился очень длинным[\s\S]*$/, "");
+  const firstLine = (source.split("\n").find(l => l.trim()) || "").replace(/^#+\s*|\*\*/g, "").trim();
+  const name = safeFileName(docx?.name || firstLine.slice(0, 50) || "Ответ", "docx");
+  const bytes = buildDocx(source, { font: docx?.font, size: docx?.size });
+  await sendFile(ctx.telegram, chatId, name, MIME.docx, bytes);
 }
 
 /**
@@ -397,9 +565,14 @@ export async function handleUpdate(update, ctx) {
   }
 
   if (command === "/reset") {
-    // Only the caller's own key, derived from the verified sender ID.
+    // Only the caller's own keys, derived from the verified sender ID.
     await kv.delete(historyKey(uid));
-    await telegram("sendMessage", { chat_id: chatId, text: "🧹 Твоя история очищена. Начинаем с чистого листа." });
+    await kv.delete(fileKey(uid));
+    await telegram("sendMessage", { chat_id: chatId, text: "🧹 Твоя история очищена, присланный файл забыт. Начинаем с чистого листа." });
+    return "ok";
+  }
+  if (command === "/word") {
+    await exportLastAnswer(ctx, uid, chatId);
     return "ok";
   }
 
@@ -415,7 +588,7 @@ export async function handleUpdate(update, ctx) {
     if (rec.lastUpdateId === updateId) {
       if (rec.undelivered) {
         try {
-          await sendFormatted(telegram, rec.undelivered.chatId, rec.undelivered.text);
+          await deliver(telegram, rec.undelivered.chatId, rec.undelivered.text);
           delete rec.undelivered;
           await saveRecord(kv, uid, rec);
           return "ok";
@@ -436,24 +609,26 @@ export async function handleUpdate(update, ctx) {
       await telegram("sendMessage", { chat_id: chatId, text: "Нечего повторять: последний запрос уже получил ответ." });
       return "ok";
     }
-    const req = { text: p.text || "", quoted: p.quoted || "", image: p.image || null };
+    const req = { text: p.text || "", quoted: p.quoted || "", image: p.image || null, file: p.file || null };
+    req.wantsFile = FILE_WORDS.test(req.text);
     const r = await runRequest(ctx, uid, chatId, updateId, req, msg.message_id);
     return r === "undelivered" ? "retry" : "ok";
   }
   if (command) {
-    await sendHtml(telegram, chatId, "Команды: /start, /help, /reset, /retry, /id");
+    await sendHtml(telegram, chatId, "Команды: /start, /help, /word, /reset, /retry, /id");
     return "ok";
   }
 
   const req = extractRequest(msg);
   if (req.error) {
-    await telegram("sendMessage", { chat_id: chatId, text: errorText(req.error) });
+    await telegram("sendMessage", { chat_id: chatId, text: errorText(req.error, req.hint) });
     return "ok";
   }
-  if (!req.text && !req.image) {
-    await telegram("sendMessage", { chat_id: chatId, text: "Пришли текст или фотографию задания 🙂" });
+  if (!req.text && !req.image && !req.file) {
+    await telegram("sendMessage", { chat_id: chatId, text: "Пришли текст, фото задания или файл 🙂" });
     return "ok";
   }
+  req.wantsFile = FILE_WORDS.test(req.text);
   const r = await runRequest(ctx, uid, chatId, updateId, req, msg.message_id);
   return r === "undelivered" ? "retry" : "ok";
 }

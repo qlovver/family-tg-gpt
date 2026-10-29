@@ -107,11 +107,11 @@ test("reply to an old photo re-uses that photo", async () => {
   assert.equal(f.calls.model[0].body.messages.at(-1).content[0].type, "image");
 });
 
-test("PDF documents are refused politely without calling the model", async () => {
+test("old .doc files are refused politely without calling the model", async () => {
   const env = makeEnv(); const f = makeFetch();
-  await send(env, f, textUpdate(111, undefined, { document: { file_id: "d", mime_type: "application/pdf" } }));
+  await send(env, f, textUpdate(111, undefined, { document: { file_id: "d", file_name: "курсовая.doc", mime_type: "application/msword" } }));
   assert.equal(f.calls.model.length, 0);
-  assert.match(sentTexts(f.calls)[0], /PDF/);
+  assert.match(sentTexts(f.calls)[0], /сохрани как \.docx/);
 });
 
 test("model failure: user gets a clear message and /retry repeats the request", async () => {
