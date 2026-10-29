@@ -308,3 +308,69 @@ export async function listModels(env, { fetchImpl = fetch } = {}) {
     return null;
   }
 }
+
+/* ---------------------------- capability probe ---------------------------- */
+
+// 96×96 PNG: red circle on white
+const RED_CIRCLE_PNG = "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAIAAABt+uBvAAABiElEQVR42u3cOxKCQBCEYejyCsYG3v9IBsYeAiNDFdh5MMO/sVX0fvZSpQUzL8sysb4vQQAQQAABBBBAAAHEAggg+3VJT/C43n5/4P56Jsab43+s/hU5lFcc0KBLllQEkDlNJJMvkCtNDJMXUBiNN5Pa6DhdV210nK5uecRyaZyOm1rqGOZRSx3DVOqqY5VNjXVMEqq3znhO/u5wA6pSn8G0OoPOSGadRGd3cu5B1kB167MvPw0yBapenx27oEF2QD3qs3UvNAigGKBO52vTjmgQQAABdHigfnfo9fuiQQABBBBAAAEEEEAsgNyAcp91n1KfQqNBAAEEUAWgfvfplTuiQQCFAXU6Zev3QoNMgXqUaNMuaJA1UPUSbc1PgxyA6pZoR3KVeHk98RU7VXnBP+sFRO5BnkBVSjSSUyXmQyQmVJUZGlnZVGjOSEoq1ZrFEp/HfnZH+uNotl+Vys2rCb66Ks70ibwu84OYQMUMM6bgnWMKHnMU+TUPEAsggAACCCCAAAKI9VlvHj+riwDMYDcAAAAASUVORK5CYII=";
+
+async function rawCall(env, model, format, body, fetchImpl) {
+  const { baseUrl } = modelConfig(env);
+  const path = format === "messages" ? "/messages" : format === "responses" ? "/responses" : "/chat/completions";
+  const headers = { "content-type": "application/json", authorization: `Bearer ${env.TOOKEN_API_KEY}` };
+  if (format === "messages") { headers["x-api-key"] = env.TOOKEN_API_KEY; headers["anthropic-version"] = "2023-06-01"; }
+  const res = await fetchImpl(baseUrl + path, { method: "POST", headers, body: JSON.stringify({ model, ...body }), signal: AbortSignal.timeout(45_000) });
+  const raw = await res.text();
+  let data = null;
+  try { data = JSON.parse(raw); } catch { /* SSE or garbage */ }
+  return { ok: res.ok, status: res.status, data, raw: raw.slice(0, 300), requestId: res.headers.get("x-request-id") || "" };
+}
+
+/**
+ * Checks what a model can really do at Tooken: tool calling and image input.
+ * Two tiny requests per check.
+ */
+export async function probeCapabilities(env, model, { fetchImpl = fetch } = {}) {
+  const format = formatFor(model, env);
+  const out = { model, format };
+  // 1) tool calling
+  try {
+    let r;
+    if (format === "messages") {
+      r = await rawCall(env, model, format, {
+        max_tokens: 200,
+        tools: [{ name: "get_weather", description: "Погода в городе", input_schema: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } }],
+        tool_choice: { type: "any" },
+        messages: [{ role: "user", content: "Узнай погоду в Москве с помощью инструмента." }],
+      }, fetchImpl);
+      const use = r.data?.content?.find?.(b => b.type === "tool_use");
+      out.tools = use ? `✅ вызвал ${use.name}(${JSON.stringify(use.input)})` : `❌ ${r.ok ? "ответил без инструмента" : `ошибка ${r.status}: ${r.raw}`}`;
+    } else {
+      r = await rawCall(env, model, "chat", {
+        max_tokens: 200,
+        tools: [{ type: "function", function: { name: "get_weather", description: "Погода в городе", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }],
+        tool_choice: "required",
+        messages: [{ role: "user", content: "Узнай погоду в Москве с помощью инструмента." }],
+      }, fetchImpl);
+      const call = r.data?.choices?.[0]?.message?.tool_calls?.[0];
+      out.tools = call ? `✅ вызвал ${call.function?.name}(${call.function?.arguments})` : `❌ ${r.ok ? "ответил без инструмента" : `ошибка ${r.status}: ${r.raw}`}`;
+    }
+    out.response_model = r.data?.model || "(не указана)";
+    out.response_id = String(r.data?.id || "").slice(0, 40);
+  } catch (err) {
+    out.tools = `❌ ${err.name === "TimeoutError" ? "таймаут" : err.message}`;
+  }
+  // 2) vision
+  try {
+    const q = "Что на картинке и какого цвета? Ответь коротко.";
+    const r = format === "messages"
+      ? await rawCall(env, model, format, { max_tokens: 60, messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: RED_CIRCLE_PNG } }, { type: "text", text: q }] }] }, fetchImpl)
+      : await rawCall(env, model, "chat", { max_tokens: 60, messages: [{ role: "user", content: [{ type: "text", text: q }, { type: "image_url", image_url: { url: `data:image/png;base64,${RED_CIRCLE_PNG}` } }] }] }, fetchImpl);
+    const text = r.data ? parseAnswer(r.data).text : "";
+    const sees = /красн|red|алый/i.test(text) && /круг|circle|шар|диск|кольц|точк/i.test(text);
+    out.vision = !r.ok ? `❌ ошибка ${r.status}: ${r.raw}` : sees ? `✅ «${text.slice(0, 80)}»` : `❌ не видит картинку: «${text.slice(0, 80)}»`;
+  } catch (err) {
+    out.vision = `❌ ${err.name === "TimeoutError" ? "таймаут" : err.message}`;
+  }
+  return out;
+}

@@ -5,7 +5,7 @@
 // Optional:  MODEL, API_FORMAT (messages|chat|responses), MODEL_STREAM, MAX_OUTPUT_TOKENS, TOOKEN_BASE_URL
 
 import { toTelegramHtml, splitHtml, htmlToPlain, escapeHtml } from "./format.js";
-import { askModel, ModelError, modelConfig, listModels, DEFAULT_MODEL } from "./model.js";
+import { askModel, ModelError, modelConfig, listModels, DEFAULT_MODEL, probeCapabilities } from "./model.js";
 import { classifyDocument, extractDocument, base64FromBytes, MAX_FILE_SIZE, MAX_PDF_SIZE, MAX_EXTRACT_CHARS } from "./files.js";
 import { extractFileBlocks, buildFile, buildDocx, safeFileName, MIME } from "./build.js";
 import { extractEditBlocks, applyEdits, docxForEdit, pptxForEdit, editKindOf } from "./edit.js";
@@ -873,6 +873,8 @@ pre{white-space:pre-wrap;word-break:break-word;background:rgba(127,127,127,.15);
 <input type="password" name="key" placeholder="SETUP_KEY" autocomplete="current-password" required>
 <label><input type="checkbox" name="webhook" checked> Подключить / обновить webhook</label>
 <label><input type="checkbox" name="model"> Проверить модель (1 маленький платный запрос)</label>
+<label><input type="checkbox" name="caps"> Проверить инструменты и зрение моделей (по 2 маленьких запроса на модель)</label>
+<input type="text" name="caps_models" placeholder="модели через запятую (пусто — Claude Opus и GPT-6.1 Sol)" style="font-size:16px;padding:10px;border-radius:8px;border:1px solid #999">
 <button type="submit">Выполнить</button>
 </form>
 ${content}
@@ -947,6 +949,12 @@ async function runSetup(request, env, ctx) {
     } catch (err) {
       report.model = { result: `❌ ${err.code || err.message}`, status: err.status, detail: err.detail, request_id: err.requestId };
     }
+  }
+  if (form.get("caps")) {
+    const list = String(form.get("caps_models") || "").split(/[\s,;]+/).filter(Boolean).slice(0, 6);
+    const models = list.length ? list : [env.MODEL || DEFAULT_MODEL, "gpt-6.1-sol"];
+    report.capabilities = [];
+    for (const m of [...new Set(models)]) report.capabilities.push(await probeCapabilities(env, m, { fetchImpl: ctx.fetchImpl }));
   }
   return html(setupPage(`<pre>${escapeHtml(JSON.stringify(report, null, 2))}</pre>`));
 }

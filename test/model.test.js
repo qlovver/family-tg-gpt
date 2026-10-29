@@ -118,3 +118,23 @@ test("empty answer is an error", async () => {
   const { fetch } = makeFetch({ model: () => ({ json: messagesReply("   ") }) });
   await assert.rejects(askModel(env, payload(), { fetchImpl: fetch }), e => e.code === "empty_response");
 });
+
+test("capability probe detects tool calls and vision", async () => {
+  const { probeCapabilities } = await import("../src/model.js");
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    const isTools = !!body.tools;
+    const data = url.endsWith("/messages")
+      ? (isTools ? { model: "claude-opus-5-5", id: "msg_1", content: [{ type: "tool_use", name: "get_weather", input: { city: "Москва" } }] }
+        : { content: [{ type: "text", text: "Красный круг на белом фоне" }] })
+      : (isTools ? { model: "gpt-6.1-sol", choices: [{ message: { content: "Не знаю" } }] }
+        : { choices: [{ message: { content: "Белый квадрат" } }] });
+    return Response.json(data);
+  };
+  const c = await probeCapabilities({ TOOKEN_API_KEY: "k" }, "claude-opus-5-5", { fetchImpl });
+  assert.match(c.tools, /✅ вызвал get_weather/);
+  assert.match(c.vision, /✅/);
+  const g = await probeCapabilities({ TOOKEN_API_KEY: "k" }, "gpt-6.1-sol", { fetchImpl });
+  assert.match(g.tools, /❌ ответил без инструмента/);
+  assert.match(g.vision, /❌ не видит/);
+});
