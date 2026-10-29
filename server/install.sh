@@ -111,14 +111,8 @@ EOF
 say "Автообновление из GitHub каждые 10 минут"
 cat > /usr/local/bin/family-agent-update <<EOF
 #!/bin/sh
-cd $DIR || exit 0
-OLD=\$(git rev-parse HEAD)
-git pull --ff-only -q || exit 0
-NEW=\$(git rev-parse HEAD)
-[ "\$OLD" = "\$NEW" ] && exit 0
-$DIR/venv/bin/pip install -q -r server/requirements.txt
-chmod -R a+rX $DIR
-systemctl restart family-agent
+# delegates to the script in the repository, so update logic can change via GitHub
+exec /bin/sh $DIR/server/update.sh
 EOF
 chmod 755 /usr/local/bin/family-agent-update
 cat > /etc/systemd/system/family-agent-update.service <<'EOF'

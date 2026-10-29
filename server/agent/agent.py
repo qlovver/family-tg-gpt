@@ -56,6 +56,8 @@ MAX_STEPS = int(ENV.get("AGENT_MAX_STEPS", "14"))
 JOB_TIMEOUT = int(ENV.get("AGENT_JOB_TIMEOUT", "480"))
 CODE_TIMEOUT = int(ENV.get("AGENT_CODE_TIMEOUT", "150"))
 MAX_TOKENS = int(ENV.get("AGENT_MAX_TOKENS", "12000"))
+LLM_TIMEOUT = int(ENV.get("AGENT_LLM_TIMEOUT", "300"))      # one model answer, total
+STALL_TIMEOUT = int(ENV.get("AGENT_STALL_TIMEOUT", "150"))  # no data at all for this long -> stop
 
 JOBS = queue.Queue()
 STATE = {"running": None, "done": 0, "failed": 0, "started": time.time()}
@@ -157,38 +159,121 @@ def tg_text(chat_id, text, reply_to=None):
             tg("sendMessage", payload)
 
 
+HEARTBEAT = int(ENV.get("AGENT_HEARTBEAT", "25"))  # seconds between status edits
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    return f"{sec // 60} мин {sec % 60:02d} с" if sec >= 60 else f"{sec} с"
+
+
 class Status:
-    """One Telegram message that shows what the agent is doing."""
+    """One Telegram message that shows live progress, refreshed every ~25 s
+    even while the model is still writing, so it's clear the job is alive."""
 
     def __init__(self, chat_id, reply_to):
         self.chat_id = chat_id
         self.msg_id = None
-        self.last = ""
-        self.t = 0
+        self.started = time.time()
+        self.done = []            # finished stages
+        self.current = "Начинаю…"
+        self.stage_started = time.time()
+        self.chars = 0            # characters streamed by the model in the current call
+        self.activity = time.time()
+        self.lock = threading.Lock()
+        self.last_text = ""
+        self.last_edit = 0
+        self.stopped = threading.Event()
+        self.failed = False
         try:
-            payload = {"chat_id": chat_id, "text": "🛠 Взял задачу в работу…"}
+            payload = {"chat_id": chat_id, "text": self.render_text()}
             if reply_to:
                 payload["reply_parameters"] = {"message_id": reply_to, "allow_sending_without_reply": True}
-            m = tg("sendMessage", payload)
-            self.msg_id = m["message_id"]
+            self.msg_id = tg("sendMessage", payload)["message_id"]
+        except Exception:
+            pass
+        threading.Thread(target=self._beat, daemon=True).start()
+
+    # --- state changes
+    def stage(self, text):
+        """Start a new current stage (the previous one is kept as is)."""
+        with self.lock:
+            self.current, self.stage_started, self.chars, self.activity = text, time.time(), 0, time.time()
+        self.flush(min_gap=3)
+
+    def finish_stage(self, text):
+        """Record a finished stage line (✅ / ❌ …)."""
+        with self.lock:
+            self.done.append(f"{text} ({fmt_dur(time.time() - self.stage_started)})")
+            self.done = self.done[-8:]
+        self.flush(min_gap=3)
+
+    def progress(self, chars):
+        with self.lock:
+            self.chars, self.activity = chars, time.time()
+
+    def set(self, text, force=False):  # backwards compatible
+        self.stage(text)
+
+    # --- rendering
+    def render_text(self):
+        now = time.time()
+        lines = [f"🛠 Работаю над задачей · {fmt_dur(now - self.started)}"]
+        lines += self.done
+        if self.failed:
+            return "\n".join(lines)
+        cur = f"⏳ {self.current} · {fmt_dur(now - self.stage_started)}"
+        if self.chars:
+            cur += f" · получено ~{self.chars:,} символов".replace(",", " ")
+        lines.append(cur)
+        silent = now - self.activity
+        if silent > 90:
+            lines.append(f"⚠️ Модель молчит уже {fmt_dur(silent)} — жду ещё, при зависании прерву сам.")
+        lines.append(f"\nОбновляется каждые ~{HEARTBEAT} с.")
+        return "\n".join(lines)
+
+    def flush(self, min_gap=0):
+        if not self.msg_id:
+            return
+        with self.lock:
+            text = self.render_text()
+            if text == self.last_text or time.time() - self.last_edit < min_gap:
+                return
+            self.last_text, self.last_edit = text, time.time()
+        try:
+            tg("editMessageText", {"chat_id": self.chat_id, "message_id": self.msg_id, "text": text}, timeout=15)
         except Exception:
             pass
 
-    def set(self, text, force=False):
-        if not self.msg_id or text == self.last or (not force and time.time() - self.t < 3):
-            return
-        self.last, self.t = text, time.time()
-        try:
-            tg("editMessageText", {"chat_id": self.chat_id, "message_id": self.msg_id, "text": text})
-        except Exception:
-            pass
+    def _beat(self):
+        while not self.stopped.wait(HEARTBEAT):
+            self.flush()
 
     def delete(self):
+        self.stopped.set()
         if self.msg_id:
             try:
                 tg("deleteMessage", {"chat_id": self.chat_id, "message_id": self.msg_id})
             except Exception:
                 pass
+
+    def complete(self):
+        self.stopped.set()
+        with self.lock:
+            lines = [f"✅ Готово за {fmt_dur(time.time() - self.started)}"] + self.done
+            self.last_text = ""
+        if self.msg_id:
+            try:
+                tg("editMessageText", {"chat_id": self.chat_id, "message_id": self.msg_id, "text": "\n".join(lines)}, timeout=15)
+            except Exception:
+                pass
+
+    def fail(self, text):
+        self.stopped.set()
+        with self.lock:
+            self.done.append(f"❌ {text}")
+            self.failed = True
+        self.flush()
 
 
 # --------------------------------------------------------------------------- tools
@@ -362,23 +447,158 @@ class LLM:
         self.format = "messages" if model.lower().startswith("claude") else "chat"
         self.tools = True
         self.vision = True
+        self.stream = ENV.get("AGENT_STREAM", "1") == "1"
 
-    def call(self, system, messages):
+    def call(self, system, messages, on_progress=None):
         if self.format == "messages":
             body = {"model": self.model, "max_tokens": MAX_TOKENS, "system": system, "messages": messages}
             if self.tools:
                 body["tools"] = anthropic_tools()
-            status, data = http_json(f"{BASE_URL}/messages", body, {"authorization": f"Bearer {API_KEY}", "x-api-key": API_KEY,
-                                                                     "anthropic-version": "2023-06-01"}, timeout=300)
+            url = f"{BASE_URL}/messages"
+            headers = {"authorization": f"Bearer {API_KEY}", "x-api-key": API_KEY, "anthropic-version": "2023-06-01"}
         else:
             body = {"model": self.model, "max_tokens": MAX_TOKENS, "messages": [{"role": "system", "content": system}] + messages}
             if self.tools:
                 body["tools"] = openai_tools()
-            status, data = http_json(f"{BASE_URL}/chat/completions", body, {"authorization": f"Bearer {API_KEY}"}, timeout=300)
+            url = f"{BASE_URL}/chat/completions"
+            headers = {"authorization": f"Bearer {API_KEY}"}
+        if self.stream:
+            try:
+                return self._stream(url, {**body, "stream": True}, headers, on_progress)
+            except LLMError as e:
+                if e.status in (400, 404, 405, 422, 501) and "stream" in e.message.lower():
+                    log("stream_unsupported", model=self.model)
+                    self.stream = False
+                else:
+                    raise
+        status, data = http_json(url, body, headers, timeout=LLM_TIMEOUT)
         if status != 200 or "error" in data and data.get("error"):
             err = data.get("error") or {}
             raise LLMError(status, str(err.get("message") or err)[:400], str(err.get("code") or err.get("type") or ""))
+        if on_progress:
+            on_progress(len(json.dumps(data, ensure_ascii=False)))
         return data
+
+    def _stream(self, url, body, headers, on_progress):
+        """Streams the answer (SSE) and rebuilds the same JSON a normal call returns."""
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
+        req.add_header("content-type", "application/json")
+        req.add_header("accept", "text/event-stream")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        try:
+            # timeout applies to each read: no bytes for STALL_TIMEOUT seconds -> error
+            resp = urllib.request.urlopen(req, timeout=STALL_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            try:
+                err = json.loads(raw).get("error") or {}
+            except Exception:
+                err = {"message": raw[:400]}
+            raise LLMError(e.code, str(err.get("message") or err)[:400], str(err.get("code") or err.get("type") or ""))
+        except (TimeoutError, OSError) as e:
+            raise LLMError(0, f"нет ответа от модели: {e}", "timeout")
+        ctype = resp.headers.get("content-type", "")
+        if "event-stream" not in ctype:
+            data = json.loads(resp.read().decode() or "{}")
+            if on_progress:
+                on_progress(len(json.dumps(data, ensure_ascii=False)))
+            if data.get("error"):
+                err = data["error"]
+                raise LLMError(resp.status, str(err.get("message") or err)[:400], str(err.get("code") or ""))
+            return data
+        chars = 0
+        started = time.time()
+        if self.format == "messages":
+            msg = {"content": [], "stop_reason": None}
+            partial = {}
+        else:
+            text, calls, finish = "", {}, None
+        try:
+            for raw in resp:
+                if time.time() - started > LLM_TIMEOUT:
+                    raise LLMError(0, f"модель отвечает дольше {LLM_TIMEOUT} с", "timeout")
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                if self.format == "messages":
+                    t = ev.get("type")
+                    if t == "error":
+                        err = ev.get("error") or {}
+                        raise LLMError(500, str(err.get("message") or err)[:400], str(err.get("type") or ""))
+                    if t == "message_start":
+                        m = ev.get("message") or {}
+                        msg.update({k: m.get(k) for k in ("id", "model", "usage") if m.get(k) is not None})
+                    elif t == "content_block_start":
+                        blk = dict(ev.get("content_block") or {})
+                        if blk.get("type") == "tool_use":
+                            blk["input"] = {}
+                            partial[ev.get("index", len(msg["content"]))] = ""
+                        if blk.get("type") == "text":
+                            blk["text"] = blk.get("text") or ""
+                        msg["content"].append(blk)
+                    elif t == "content_block_delta":
+                        i = ev.get("index", len(msg["content"]) - 1)
+                        d = ev.get("delta") or {}
+                        if i >= len(msg["content"]):
+                            continue
+                        if d.get("type") == "text_delta":
+                            msg["content"][i]["text"] = msg["content"][i].get("text", "") + d.get("text", "")
+                            chars += len(d.get("text", ""))
+                        elif d.get("type") == "input_json_delta":
+                            partial[i] = partial.get(i, "") + d.get("partial_json", "")
+                            chars += len(d.get("partial_json", ""))
+                    elif t == "content_block_stop":
+                        i = ev.get("index", len(msg["content"]) - 1)
+                        if i in partial and i < len(msg["content"]):
+                            try:
+                                msg["content"][i]["input"] = json.loads(partial[i] or "{}")
+                            except Exception:
+                                msg["content"][i]["input"] = {"code": partial[i]} if msg["content"][i].get("name") == "run_python" else {}
+                    elif t == "message_delta":
+                        msg["stop_reason"] = (ev.get("delta") or {}).get("stop_reason")
+                else:
+                    if ev.get("error"):
+                        err = ev["error"]
+                        raise LLMError(500, str(err.get("message") or err)[:400], str(err.get("code") or ""))
+                    ch = (ev.get("choices") or [{}])[0]
+                    d = ch.get("delta") or {}
+                    if d.get("content"):
+                        text += d["content"]
+                        chars += len(d["content"])
+                    for tc in d.get("tool_calls") or []:
+                        k = tc.get("index", 0)
+                        c = calls.setdefault(k, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            c["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            c["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            c["function"]["arguments"] += fn["arguments"]
+                            chars += len(fn["arguments"])
+                    if ch.get("finish_reason"):
+                        finish = ch["finish_reason"]
+                if on_progress:
+                    on_progress(chars)
+        except (TimeoutError, OSError) as e:
+            raise LLMError(0, f"модель перестала отвечать ({STALL_TIMEOUT} с без данных)", "timeout")
+        if self.format == "messages":
+            for blk in msg["content"]:
+                if blk.get("type") == "tool_use" and not isinstance(blk.get("input"), dict):
+                    blk["input"] = {}
+            return msg
+        message = {"role": "assistant", "content": text or None}
+        if calls:
+            message["tool_calls"] = [calls[k] for k in sorted(calls)]
+        return {"choices": [{"message": message, "finish_reason": finish}]}
 
 
 class LLMError(Exception):
@@ -424,9 +644,9 @@ def run_agent(job, status):
     step = 0
     while step < MAX_STEPS and time.time() < deadline:
         step += 1
-        status.set(f"🧠 Думаю… (шаг {step})")
+        status.stage("Модель думает и пишет" if step == 1 else "Модель анализирует результат")
         try:
-            data = llm.call(system + ("" if llm.tools else TEXT_PROTOCOL), messages)
+            data = llm.call(system + ("" if llm.tools else TEXT_PROTOCOL), messages, on_progress=status.progress)
         except LLMError as e:
             low = e.message.lower()
             if llm.tools and e.status in (400, 404, 422) and ("tool" in low or "function" in low):
@@ -442,6 +662,14 @@ def run_agent(job, status):
             raise
         calls, text, assistant_msg = parse_reply(data, llm)
         messages.append(assistant_msg)
+        names = [c["name"] for c in calls]
+        if "run_python" in names:
+            code = next(c["args"].get("code", "") for c in calls if c["name"] == "run_python")
+            status.finish_stage(f"✅ Модель написала код ({code.count(chr(10)) + 1} строк)")
+        elif "render" in names:
+            status.finish_stage("✅ Модель решила проверить результат")
+        elif names:
+            status.finish_stage("✅ Модель закончила")
         if not calls:
             # plain answer: maybe a code block written as text
             m = CODE_BLOCK.search(text or "")
@@ -464,17 +692,23 @@ def run_agent(job, status):
             imgs = []
             try:
                 if name == "run_python":
-                    status.set(f"💻 Выполняю код… (шаг {step})")
+                    status.stage("Выполняю код")
                     out = run_python(job, args.get("code", ""))
+                    ok = out.startswith("exit code: 0")
+                    made = re.search(r"Изменились/появились: (.+)", out)
+                    status.finish_stage(("✅ Код выполнен" + (f": {made.group(1)[:80]}" if made else "")) if ok else "⚠️ В коде ошибка — модель исправит")
                 elif name == "render":
-                    status.set(f"👀 Проверяю, как выглядит… (шаг {step})")
+                    status.stage("Отрисовываю, чтобы проверить, как выглядит")
                     out, imgs = render(job, args.get("path", ""))
+                    pages = re.search(r"страниц/слайдов: (\d+)", out)
+                    status.finish_stage(f"✅ Отрисовал {pages.group(1)} стр./слайдов для проверки" if pages else "⚠️ Отрисовать не получилось")
                     if not llm.vision:
                         imgs = []
                         out += " (Картинки недоступны этой модели — проверь по тексту и размерам.)"
                 elif name == "send_file":
-                    status.set("📤 Отправляю файл…")
+                    status.stage("Отправляю файл")
                     out = deliver_file(job, args)
+                    status.finish_stage(f"✅ {out}")
                     sent.append(out)
                 elif name == "finish":
                     final = args.get("message", "")
@@ -645,7 +879,7 @@ def process(job):
             data = tg_download(img["file_id"], inp)
             job["images"].append(base64.b64encode(data).decode())
         final = run_agent(job, status)
-        status.delete()
+        status.complete()
         tg_text(job["chat_id"], final, job.get("reply_to"))
         STATE["done"] += 1
         names = [os.path.basename(p) for p in job["sent_paths"]]
@@ -654,10 +888,10 @@ def process(job):
     except Exception as e:
         STATE["failed"] += 1
         log("job_failed", id=jid, error=str(e)[:300], trace=traceback.format_exc()[-1500:])
-        status.delete()
-        msg = "😕 Не получилось выполнить задачу на сервере"
-        if isinstance(e, LLMError):
-            msg += f" (ошибка модели {e.status})"
+        reason = (e.message if isinstance(e, LLMError) and e.code == "timeout" else
+                  f"ошибка модели {e.status}: {e.message[:120]}" if isinstance(e, LLMError) else str(e)[:150])
+        status.fail(reason)
+        msg = f"😕 Не получилось выполнить задачу на сервере: {reason}"
         try:
             tg_text(job["chat_id"], msg + ". Попробуй ещё раз или упрости задачу.", job.get("reply_to"))
         except Exception:
