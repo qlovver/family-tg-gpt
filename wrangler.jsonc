@@ -2,5 +2,20 @@
   "name": "family-tg-gpt",
   "main": "worker.js",
   "compatibility_date": "2026-10-29",
-  "workers_dev": true
+  "workers_dev": true,
+
+  // KV for per-user dialogue history. Declared here so that every deploy
+  // from GitHub keeps the binding (bindings missing from this file are
+  // removed on deploy). The id is the existing "kv-get-started" namespace;
+  // it is not a secret.
+  "kv_namespaces": [
+    { "binding": "HISTORY", "id": "296c6d012152408893bc0db4d9f61e34" }
+  ],
+
+  // Keep text variables set in the dashboard (ALLOWED_USER_IDS) on deploy.
+  // Secrets are always kept.
+  "keep_vars": true,
+
+  // Workers Logs: diagnostic events (no secrets, no message texts).
+  "observability": { "enabled": true }
 }
